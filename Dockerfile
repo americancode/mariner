@@ -9,11 +9,11 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/mariner ./cmd/mariner
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/periscope ./cmd/periscope
 
 FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/mariner /mariner
+COPY --from=build /out/periscope /periscope
 COPY --from=frontend /src/frontend/dist /web
 EXPOSE 8080
 USER 65532:65532
-ENTRYPOINT ["/mariner"]
+ENTRYPOINT ["/periscope"]

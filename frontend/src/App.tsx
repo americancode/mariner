@@ -25,8 +25,8 @@ import { api, AuditEvent, BrowseKind, Connection, Item, Organization } from "./a
 
 type User = { authenticated: boolean; name?: string; isAdmin?: boolean };
 type ErrorHandler = (message: string) => void;
-const promptUnlockAfterSignInKey = "mariner_prompt_unlock_after_sign_in";
-const themeStorageKey = "mariner.theme";
+const promptUnlockAfterSignInKey = "periscope_prompt_unlock_after_sign_in";
+const themeStorageKey = "periscope.theme";
 
 function storedThemeIsDark() {
   return window.localStorage.getItem(themeStorageKey) === "dark";
@@ -320,7 +320,7 @@ function AdminPage() {
   return (
     <div className="admin-layout">
       <aside className="admin-sidebar">
-        <a className="logo" href="/">mariner</a>
+        <a className="logo" href="/">periscope</a>
         <span className="eyebrow">ADMINISTRATION</span>
         <nav className="admin-nav" aria-label="Admin navigation">
           <a className={!auditPage && !organizationsPage ? "active" : ""} href="/admin">Overview</a>
@@ -328,7 +328,7 @@ function AdminPage() {
           <a className={organizationsPage ? "active" : ""} href="/admin/organizations">Organizations</a>
         </nav>
         <a className="secondary admin-back" href="/" onClick={promptUnlockOnReturn}>
-          Back to Mariner
+          Back to periscope
         </a>
       </aside>
       <main className="admin-main">
@@ -345,7 +345,7 @@ function AdminOverviewPage() {
   return (
     <section className="admin-landing">
       <span className="eyebrow">ADMINISTRATION</span>
-      <h1>Mariner administration</h1>
+      <h1>periscope administration</h1>
       <p>Manage application activity and organization access from one workspace.</p>
       <div className="admin-cards">
         <a className="card admin-card" href="/admin/audit"><h2>Audit logs</h2><p>Search security and S3 activity with database-backed filters.</p></a>
@@ -491,7 +491,7 @@ function Login() {
   return (
     <main className="center">
       <section className="card login">
-        <div className="logo">mariner</div>
+        <div className="logo">periscope</div>
         <h1>Private S3, clearly managed.</h1>
         <p>
           Sign in with your identity provider to access your encrypted bucket
@@ -534,7 +534,7 @@ function Sidebar({
 }) {
   return (
     <aside>
-      <div className="logo">mariner</div>
+      <div className="logo">periscope</div>
       <span className="eyebrow">SIGNED IN AS</span>
       <p>{userName?.trim() || "OIDC user"}</p>
       <span className="eyebrow">CONNECTIONS</span>
@@ -768,7 +768,7 @@ function UnlockModal({
         <h2>{initialSetup ? "Create your vault" : "Unlock your vault"}</h2>
         <p>
           {initialSetup
-            ? "Choose a master password to create your encrypted vault. It protects the S3 connections saved by your account, and Mariner cannot recover it."
+            ? "Choose a master password to create your encrypted vault. It protects the S3 connections saved by your account, and periscope cannot recover it."
             : "Enter your master password to decrypt and access your saved S3 connections."}
         </p>
         {initialSetup && (

@@ -2,7 +2,7 @@
 # native Kubernetes Secrets by scripts/deploy-org1-test.sh; replace these
 # values with ExternalSecrets for any shared or production environment.
 image:
-  repository: localhost/mariner
+  repository: localhost/periscope
   tag: local
   pullPolicy: Never
 
@@ -12,7 +12,7 @@ persistence:
 database:
   driver: postgres
   existingSecret:
-    name: mariner-postgres
+    name: periscope-postgres
     hostKey: host
     portKey: port
     databaseKey: database
@@ -20,10 +20,10 @@ database:
     passwordKey: password
 
 oidc:
-  issuer: https://keycloak.127.0.0.1.sslip.io/realms/mariner
-  clientId: mariner
-  clientSecret: MarinerClientSecret123!
-  redirectUrl: https://mariner.127.0.0.1.sslip.io/auth/callback
+  issuer: https://keycloak.127.0.0.1.sslip.io/realms/periscope
+  clientId: periscope
+  clientSecret: periscopeClientSecret123!
+  redirectUrl: https://periscope.127.0.0.1.sslip.io/auth/callback
   groupsClaim: groups
 
 caBundle:
@@ -34,14 +34,14 @@ ingress:
   enabled: true
   className: traefik
   hosts:
-    - host: mariner.127.0.0.1.sslip.io
+    - host: periscope.127.0.0.1.sslip.io
       paths:
         - path: /
           pathType: Prefix
   tls:
     - secretName: sslip-io-tls
       hosts:
-        - mariner.127.0.0.1.sslip.io
+        - periscope.127.0.0.1.sslip.io
 
 organizations:
   ORG1:

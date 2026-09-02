@@ -25,7 +25,7 @@ jobs:
         uses: azure/setup-helm@v5.0.1
 
       - name: Lint chart
-        run: helm lint deploy/helm/mariner
+        run: helm lint deploy/helm/periscope
 
       - name: Scan source and chart
         uses: aquasecurity/trivy-action@v0.36.0
@@ -203,9 +203,9 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           chart_version="${VERSION}"
-          helm package deploy/helm/mariner --version "$chart_version" --app-version "$chart_version"
+          helm package deploy/helm/periscope --version "$chart_version" --app-version "$chart_version"
           echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
-          helm push "mariner-${chart_version}.tgz" "oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/helm-charts"
+          helm push "periscope-${chart_version}.tgz" "oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/helm-charts"
 
   prune-registry:
     name: Prune GHCR images and signatures

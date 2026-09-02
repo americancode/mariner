@@ -3,18 +3,18 @@ kind: ConfigMap
 metadata:
   name: keycloak-realm
 data:
-  mariner-realm.json: |
+  periscope-realm.json: |
     {
-      "realm": "mariner",
+      "realm": "periscope",
       "enabled": true,
       "registrationAllowed": false,
       "clients": [{
-        "clientId": "mariner",
+        "clientId": "periscope",
         "enabled": true,
         "publicClient": false,
-        "secret": "MarinerClientSecret123!",
-        "redirectUris": ["https://mariner.127.0.0.1.sslip.io/auth/callback"],
-        "webOrigins": ["https://mariner.127.0.0.1.sslip.io"],
+        "secret": "periscopeClientSecret123!",
+        "redirectUris": ["https://periscope.127.0.0.1.sslip.io/auth/callback"],
+        "webOrigins": ["https://periscope.127.0.0.1.sslip.io"],
         "standardFlowEnabled": true,
         "protocol": "openid-connect"
       }],

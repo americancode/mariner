@@ -12,7 +12,7 @@ metadata:
   namespace: cert-manager
 spec:
   isCA: true
-  commonName: mariner-local-ca
+  commonName: periscope-local-ca
   secretName: sslip-io-ca
   privateKey:
     algorithm: RSA
@@ -38,7 +38,7 @@ metadata:
 spec:
   secretName: sslip-io-tls
   dnsNames:
-    - mariner.127.0.0.1.sslip.io
+    - periscope.127.0.0.1.sslip.io
     - keycloak.127.0.0.1.sslip.io
     - minio.127.0.0.1.sslip.io
   issuerRef:

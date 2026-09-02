@@ -6,7 +6,7 @@ import (
 	"net/url"
 	"os"
 
-	"mariner/internal/vault"
+	"periscope/internal/vault"
 )
 
 type Organization = vault.Organization
@@ -25,10 +25,10 @@ func Load() Config {
 	if databaseURL == "" && databaseDriver == "postgres" {
 		databaseURL = postgresURL()
 	}
-	cfg := Config{Addr: value("ADDR", ":8080"), DataDir: value("DATA_DIR", "./data"), DatabaseDriver: databaseDriver, DatabaseURL: databaseURL, AuditAdminGroup: value("AUDIT_ADMIN_GROUP", "admins"), OrganizationEncryptionKey: os.Getenv("MARINER_ORG_ENCRYPTION_KEY"), AuditEnabled: os.Getenv("AUDIT_ENABLED") != "false", OIDCIssuer: os.Getenv("OIDC_ISSUER"), OIDCClientID: os.Getenv("OIDC_CLIENT_ID"), OIDCClientSecret: os.Getenv("OIDC_CLIENT_SECRET"), OIDCRedirectURL: os.Getenv("OIDC_REDIRECT_URL"), CookieSecret: value("COOKIE_SECRET", "change-me-in-production"), OIDCGroupsClaim: value("OIDC_GROUPS_CLAIM", "groups"), OIDCAudienceClaim: value("OIDC_AUDIENCE_CLAIM", "aud"), OIDCAudience: value("OIDC_AUDIENCE", os.Getenv("OIDC_CLIENT_ID")), OIDCNameClaim: value("OIDC_NAME_CLAIM", "name"), OIDCDebugJWT: os.Getenv("OIDC_DEBUG_JWT") == "true"}
-	if raw := os.Getenv("MARINER_ORGANIZATIONS_JSON"); raw != "" {
+	cfg := Config{Addr: value("ADDR", ":8080"), DataDir: value("DATA_DIR", "./data"), DatabaseDriver: databaseDriver, DatabaseURL: databaseURL, AuditAdminGroup: value("AUDIT_ADMIN_GROUP", "admins"), OrganizationEncryptionKey: os.Getenv("periscope_ORG_ENCRYPTION_KEY"), AuditEnabled: os.Getenv("AUDIT_ENABLED") != "false", OIDCIssuer: os.Getenv("OIDC_ISSUER"), OIDCClientID: os.Getenv("OIDC_CLIENT_ID"), OIDCClientSecret: os.Getenv("OIDC_CLIENT_SECRET"), OIDCRedirectURL: os.Getenv("OIDC_REDIRECT_URL"), CookieSecret: value("COOKIE_SECRET", "change-me-in-production"), OIDCGroupsClaim: value("OIDC_GROUPS_CLAIM", "groups"), OIDCAudienceClaim: value("OIDC_AUDIENCE_CLAIM", "aud"), OIDCAudience: value("OIDC_AUDIENCE", os.Getenv("OIDC_CLIENT_ID")), OIDCNameClaim: value("OIDC_NAME_CLAIM", "name"), OIDCDebugJWT: os.Getenv("OIDC_DEBUG_JWT") == "true"}
+	if raw := os.Getenv("periscope_ORGANIZATIONS_JSON"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.Organizations); err != nil {
-			panic(fmt.Sprintf("invalid MARINER_ORGANIZATIONS_JSON: %v", err))
+			panic(fmt.Sprintf("invalid periscope_ORGANIZATIONS_JSON: %v", err))
 		}
 	}
 	for orgName, organization := range cfg.Organizations {

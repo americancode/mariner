@@ -2,9 +2,9 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "mariner.fullname" . }}
+  name: {{ include "periscope.fullname" . }}
   labels:
-    {{- include "mariner.labels" . | nindent 4 }}
+    {{- include "periscope.labels" . | nindent 4 }}
 spec:
   accessModes:
     {{- toYaml .Values.persistence.accessModes | nindent 4 }}

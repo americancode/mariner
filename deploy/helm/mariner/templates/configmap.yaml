@@ -1,9 +1,9 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "mariner.fullname" . }}
+  name: {{ include "periscope.fullname" . }}
   labels:
-    {{- include "mariner.labels" . | nindent 4 }}
+    {{- include "periscope.labels" . | nindent 4 }}
 data:
   DATABASE_DRIVER: {{ default "sqlite" .Values.database.driver | quote }}
   AUDIT_ENABLED: {{ default true .Values.audit.enabled | quote }}
@@ -24,11 +24,11 @@ data:
   {{- $connection := dict "id" (default $connectionName $configured.id) "name" (default $connectionName $configured.name) "bucket" $configured.bucket "region" (default "us-east-1" $configured.region) "prefix" (default "" $configured.prefix) "endpoint" (default "" $configured.endpoint) }}
   {{- $orgKey := upper (replace "-" "_" (default $organizationName $org.id)) }}
   {{- $connKey := upper (replace "-" "_" (default $connectionName $configured.id)) }}
-  {{- $_ := set $connection "accessKeyEnv" (printf "MARINER_ORG_%s_CONN_%s_ACCESS_KEY" $orgKey $connKey) }}
-  {{- $_ := set $connection "secretKeyEnv" (printf "MARINER_ORG_%s_CONN_%s_SECRET_KEY" $orgKey $connKey) }}
+  {{- $_ := set $connection "accessKeyEnv" (printf "periscope_ORG_%s_CONN_%s_ACCESS_KEY" $orgKey $connKey) }}
+  {{- $_ := set $connection "secretKeyEnv" (printf "periscope_ORG_%s_CONN_%s_SECRET_KEY" $orgKey $connKey) }}
   {{- $_ := set $connections $connectionName $connection }}
   {{- end }}
   {{- $organization := dict "id" (default $organizationName $org.id) "name" (default $organizationName $org.name) "groups" (default (list (default $organizationName $org.id)) $org.groups) "connections" $connections }}
   {{- $_ := set $organizations $organizationName $organization }}
   {{- end }}
-  MARINER_ORGANIZATIONS_JSON: {{ $organizations | toJson | quote }}
+  periscope_ORGANIZATIONS_JSON: {{ $organizations | toJson | quote }}

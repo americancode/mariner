@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"mariner/internal/vault"
+	"periscope/internal/vault"
 )
 
 // RunForwarder emits new database audit JSON events to stdout. The cursor is

@@ -1,5 +1,5 @@
 apiVersion: v2
-name: mariner
+name: periscope
 description: S3 file explorer with OIDC authentication and an encrypted SQLite vault
 type: application
 version: 1.0.11

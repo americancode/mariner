@@ -1,15 +1,15 @@
-mariner has been installed.
+periscope has been installed.
 
 Configure the OIDC client callback URL as:
   {{ (index .Values.ingress.hosts 0).host }}/auth/callback
 
 If ingress is disabled, reach the service with:
-  kubectl port-forward svc/{{ include "mariner.fullname" . }} 8080:{{ .Values.service.port }}
+  kubectl port-forward svc/{{ include "periscope.fullname" . }} 8080:{{ .Values.service.port }}
 
 {{- if eq .Values.database.driver "sqlite" }}
-The SQLite vault is persisted in the {{ include "mariner.fullname" . }} PVC.
+The SQLite vault is persisted in the {{ include "periscope.fullname" . }} PVC.
 {{- else }}
-Mariner uses PostgreSQL through the configured database URL or Secret.
+periscope uses PostgreSQL through the configured database URL or Secret.
 {{- end }}
 The audit sidecar polls the database and forwards new canonical JSON events to
 stdout when enabled; no shared audit-log volume is required.

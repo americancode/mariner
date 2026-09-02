@@ -9,8 +9,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"mariner/internal/tlsconfig"
-	"mariner/internal/vault"
+	"periscope/internal/tlsconfig"
+	"periscope/internal/vault"
 )
 
 func New(ctx context.Context, connection vault.Connection) (*s3.Client, error) {

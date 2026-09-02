@@ -27,11 +27,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/go-chi/chi/v5"
-	"mariner/internal/audit"
-	"mariner/internal/auth"
-	"mariner/internal/config"
-	s3client "mariner/internal/s3"
-	"mariner/internal/vault"
+	"periscope/internal/audit"
+	"periscope/internal/auth"
+	"periscope/internal/config"
+	s3client "periscope/internal/s3"
+	"periscope/internal/vault"
 )
 
 type Server struct {

@@ -1,24 +1,24 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "mariner.fullname" . }}
+  name: {{ include "periscope.fullname" . }}
   labels:
-    {{- include "mariner.labels" . | nindent 4 }}
+    {{- include "periscope.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      {{- include "mariner.selectorLabels" . | nindent 6 }}
+      {{- include "periscope.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "mariner.selectorLabels" . | nindent 8 }}
+        {{- include "periscope.selectorLabels" . | nindent 8 }}
       {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      serviceAccountName: {{ include "mariner.serviceAccountName" . }}
+      serviceAccountName: {{ include "periscope.serviceAccountName" . }}
       {{- with .Values.hostAliases }}
       hostAliases:
         {{- toYaml . | nindent 8 }}
@@ -36,8 +36,8 @@ spec:
             - >-
               cp /etc/ssl/certs/ca-certificates.crt /work/ca-certificates.crt
               && printf '\n' >> /work/ca-certificates.crt
-              && if [ -d /etc/mariner-ca/secret ]; then for file in /etc/mariner-ca/secret/*; do cat "$file" >> /work/ca-certificates.crt; printf '\n' >> /work/ca-certificates.crt; done; fi
-              && if [ -d /etc/mariner-ca/configmap ]; then for file in /etc/mariner-ca/configmap/*; do cat "$file" >> /work/ca-certificates.crt; printf '\n' >> /work/ca-certificates.crt; done; fi
+              && if [ -d /etc/periscope-ca/secret ]; then for file in /etc/periscope-ca/secret/*; do cat "$file" >> /work/ca-certificates.crt; printf '\n' >> /work/ca-certificates.crt; done; fi
+              && if [ -d /etc/periscope-ca/configmap ]; then for file in /etc/periscope-ca/configmap/*; do cat "$file" >> /work/ca-certificates.crt; printf '\n' >> /work/ca-certificates.crt; done; fi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -53,17 +53,17 @@ spec:
               mountPath: /work
             {{- if .Values.caBundle.secretName }}
             - name: ca-input-secret
-              mountPath: /etc/mariner-ca/secret
+              mountPath: /etc/periscope-ca/secret
               readOnly: true
             {{- end }}
             {{- if .Values.caBundle.configMapName }}
             - name: ca-input-configmap
-              mountPath: /etc/mariner-ca/configmap
+              mountPath: /etc/periscope-ca/configmap
               readOnly: true
             {{- end }}
       {{- end }}
       containers:
-        - name: mariner
+        - name: periscope
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
@@ -74,7 +74,7 @@ spec:
               protocol: TCP
           envFrom:
             - configMapRef:
-                name: {{ include "mariner.fullname" . }}
+                name: {{ include "periscope.fullname" . }}
           env:
             - name: ADDR
               value: ":8080"
@@ -83,18 +83,18 @@ spec:
             - name: COOKIE_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "mariner.secretName" . }}
+                  name: {{ include "periscope.secretName" . }}
                   key: COOKIE_SECRET
             - name: OIDC_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "mariner.secretName" . }}
+                  name: {{ include "periscope.secretName" . }}
                   key: {{ if .Values.existingSecret.name }}{{ required "existingSecret.clientSecretKey is required" .Values.existingSecret.clientSecretKey }}{{ else }}OIDC_CLIENT_SECRET{{ end }}
             - name: OIDC_CLIENT_ID
               {{- if .Values.existingSecret.name }}
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "mariner.secretName" . }}
+                  name: {{ include "periscope.secretName" . }}
                   key: {{ required "existingSecret.clientIdKey is required" .Values.existingSecret.clientIdKey }}
               {{- else }}
               value: {{ required "oidc.clientId is required when existingSecret.name is empty" .Values.oidc.clientId | quote }}
@@ -139,23 +139,23 @@ spec:
               value: {{ .Values.database.url | quote }}
             {{- end }}
             {{- if .Values.organizationEncryption.enabled }}
-            - name: MARINER_ORG_ENCRYPTION_KEY
+            - name: periscope_ORG_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "mariner.organizationEncryptionSecretName" . }}
-                  key: {{ include "mariner.organizationEncryptionSecretKey" . }}
+                  name: {{ include "periscope.organizationEncryptionSecretName" . }}
+                  key: {{ include "periscope.organizationEncryptionSecretKey" . }}
             {{- end }}
             {{- range $organizationName, $configuredOrg := .Values.organizations }}
             {{- $orgKey := upper (replace "-" "_" (default $organizationName $configuredOrg.id)) }}
             {{- range $connectionName, $configured := $configuredOrg.connections }}
             {{- $connKey := upper (replace "-" "_" (default $connectionName $configured.id)) }}
             {{- with $configured.credentials }}
-            - name: MARINER_ORG_{{ $orgKey }}_CONN_{{ $connKey }}_ACCESS_KEY
+            - name: periscope_ORG_{{ $orgKey }}_CONN_{{ $connKey }}_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ required "organization connection credentials.secretName is required" .secretName }}
                   key: {{ default "accessKey" .accessKeyKey }}
-            - name: MARINER_ORG_{{ $orgKey }}_CONN_{{ $connKey }}_SECRET_KEY
+            - name: periscope_ORG_{{ $orgKey }}_CONN_{{ $connKey }}_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ required "organization connection credentials.secretName is required" .secretName }}
@@ -165,7 +165,7 @@ spec:
             {{- end }}
             {{- if or .Values.caBundle.secretName .Values.caBundle.configMapName }}
             - name: SSL_CERT_FILE
-              value: /etc/mariner-ca-bundle/ca-certificates.crt
+              value: /etc/periscope-ca-bundle/ca-certificates.crt
             {{- end }}
           readinessProbe:
             httpGet:
@@ -188,7 +188,7 @@ spec:
               mountPath: /tmp
             {{- if or .Values.caBundle.secretName .Values.caBundle.configMapName }}
             - name: ca-bundle
-              mountPath: /etc/mariner-ca-bundle
+              mountPath: /etc/periscope-ca-bundle
               readOnly: true
             {{- end }}
             {{- with .Values.extraVolumeMounts }}
@@ -202,7 +202,7 @@ spec:
           command:
             {{- toYaml .Values.audit.sidecar.command | nindent 12 }}
           {{- else }}
-          command: ["/mariner", "audit-forwarder"]
+          command: ["/periscope", "audit-forwarder"]
           {{- end }}
           {{- if .Values.audit.sidecar.args }}
           args:
@@ -279,7 +279,7 @@ spec:
         - name: data
           {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:
-            claimName: {{ include "mariner.fullname" . }}
+            claimName: {{ include "periscope.fullname" . }}
           {{- else }}
           emptyDir: {}
           {{- end }}

@@ -16,7 +16,7 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
-	"mariner/internal/tlsconfig"
+	"periscope/internal/tlsconfig"
 )
 
 type User struct {
@@ -54,11 +54,11 @@ func New(issuer, clientID, clientSecret, redirect, cookieSecret, groupsClaim, au
 }
 func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
 	state := random(18)
-	s.setCookie(w, "mariner_state", state, 600)
+	s.setCookie(w, "periscope_state", state, 600)
 	http.Redirect(w, r, s.OAuth.AuthCodeURL(state), http.StatusFound)
 }
 func (s *Service) Callback(r *http.Request) (User, string, error) {
-	if r.URL.Query().Get("state") != s.cookie(r, "mariner_state") {
+	if r.URL.Query().Get("state") != s.cookie(r, "periscope_state") {
 		return User{}, "", errors.New("invalid OIDC state")
 	}
 	token, err := s.OAuth.Exchange(r.Context(), r.URL.Query().Get("code"))
@@ -140,10 +140,10 @@ func (s *Service) StartSession(w http.ResponseWriter, id string, user User) {
 	s.mu.Lock()
 	s.sessions[id] = Session{User: user, Expires: time.Now().Add(12 * time.Hour)}
 	s.mu.Unlock()
-	s.setCookie(w, "mariner_session", id, 43200)
+	s.setCookie(w, "periscope_session", id, 43200)
 }
 func (s *Service) Current(r *http.Request) (Session, string, bool) {
-	id := s.cookie(r, "mariner_session")
+	id := s.cookie(r, "periscope_session")
 	s.mu.RLock()
 	session, ok := s.sessions[id]
 	s.mu.RUnlock()
@@ -158,11 +158,11 @@ func (s *Service) SetPassword(id, password string) {
 }
 func (s *Service) Lock(id string) { s.SetPassword(id, "") }
 func (s *Service) Logout(w http.ResponseWriter, r *http.Request) {
-	id := s.cookie(r, "mariner_session")
+	id := s.cookie(r, "periscope_session")
 	s.mu.Lock()
 	delete(s.sessions, id)
 	s.mu.Unlock()
-	s.setCookie(w, "mariner_session", "", -1)
+	s.setCookie(w, "periscope_session", "", -1)
 }
 func (s *Service) setCookie(w http.ResponseWriter, name, value string, age int) {
 	mac := hmac.New(sha256.New, []byte(s.CookieSecret))

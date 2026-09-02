@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"mariner/internal/vault"
+	"periscope/internal/vault"
 	_ "modernc.org/sqlite"
 )
 
@@ -27,7 +27,7 @@ func TestWritePersistsCanonicalJSONToDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err := sql.Open("sqlite", filepath.Join(dir, "mariner.db"))
+	db, err := sql.Open("sqlite", filepath.Join(dir, "periscope.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,4 +1,4 @@
-module mariner
+module periscope
 
 go 1.26.6
 

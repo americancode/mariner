@@ -2,4 +2,4 @@
 oidc:
   clientId: scan
   issuer: https://oidc.invalid/realms/scan
-  redirectUrl: https://mariner.invalid/auth/callback
+  redirectUrl: https://periscope.invalid/auth/callback

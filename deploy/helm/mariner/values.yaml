@@ -1,6 +1,6 @@
 replicaCount: 1
 image:
-  repository: ghcr.io/example/mariner
+  repository: ghcr.io/example/periscope
   tag: latest
   pullPolicy: IfNotPresent
 serviceAccount:
@@ -15,14 +15,14 @@ ingress:
   className: ""
   annotations: {}
   hosts:
-    - host: mariner.example.com
+    - host: periscope.example.com
       paths:
         - path: /
           pathType: Prefix
   tls:
     - secretName: sslip-io-tls
       hosts:
-        - mariner.127.0.0.1.sslip.io
+        - periscope.127.0.0.1.sslip.io
 oidc:
   issuer: ""
   clientId: ""
@@ -90,7 +90,7 @@ cookieSecret: ""
 #           secretKeyKey: secretKey
 organizations: {}
 
-# Additional Kubernetes objects rendered after the Mariner resources. This is
+# Additional Kubernetes objects rendered after the periscope resources. This is
 # intentionally generic so ExternalSecret, SecretStore, NetworkPolicy, or
 # other platform resources can be installed with the same Helm release.
 # Objects are rendered as supplied; set metadata.namespace explicitly when
@@ -145,7 +145,7 @@ database:
   existingSecret:
     name: ""
     # A URL key may be used by setting urlKey and leaving the field selectors
-    # empty. Otherwise Mariner assembles a URL from these independently named
+    # empty. Otherwise periscope assembles a URL from these independently named
     # Secret keys. Host, database, username, and password are required.
     urlKey: ""
     hostKey: host

@@ -141,7 +141,7 @@ func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
-	db, err := sqlx.Open("sqlite", filepath.Join(dir, "mariner.db"))
+	db, err := sqlx.Open("sqlite", filepath.Join(dir, "periscope.db"))
 	if err != nil {
 		return nil, err
 	}

@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"mariner/internal/vault"
+	"periscope/internal/vault"
 )
 
 // Logger writes the canonical JSON event to the database. Delivery to stdout

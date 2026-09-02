@@ -8,11 +8,11 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"mariner/internal/audit"
-	"mariner/internal/auth"
-	"mariner/internal/config"
-	"mariner/internal/httpapi"
-	"mariner/internal/vault"
+	"periscope/internal/audit"
+	"periscope/internal/auth"
+	"periscope/internal/config"
+	"periscope/internal/httpapi"
+	"periscope/internal/vault"
 	_ "modernc.org/sqlite"
 )
 
@@ -40,6 +40,6 @@ func main() {
 		log.Fatal(err)
 	}
 	server := &httpapi.Server{Auth: authService, Vault: store, Audit: auditLogger, AuditAdminGroup: cfg.AuditAdminGroup, Organizations: cfg.Organizations}
-	log.Printf("mariner listening on %s", cfg.Addr)
+	log.Printf("periscope listening on %s", cfg.Addr)
 	log.Fatal(http.ListenAndServe(cfg.Addr, server.Router()))
 }
