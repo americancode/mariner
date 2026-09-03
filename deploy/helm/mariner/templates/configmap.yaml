@@ -5,7 +5,7 @@ metadata:
   labels:
     {{- include "mariner.labels" . | nindent 4 }}
 data:
-  DATABASE_DRIVER: {{ default "sqlite" .Values.database.driver | quote }}
+  DATABASE_DRIVER: {{ default "postgres" .Values.database.driver | quote }}
   AUDIT_ENABLED: {{ default true .Values.audit.enabled | quote }}
   AUDIT_ADMIN_GROUP: {{ default "admins" .Values.audit.adminGroup | quote }}
   OIDC_ISSUER: {{ required "oidc.issuer is required" .Values.oidc.issuer | quote }}

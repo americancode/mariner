@@ -1,7 +1,8 @@
 replicaCount: 1
 image:
   repository: ghcr.io/example/mariner
-  tag: latest
+  # Empty uses the chart's appVersion.
+  tag: ""
   pullPolicy: IfNotPresent
 serviceAccount:
   create: true
@@ -49,7 +50,20 @@ caBundle:
   configMapName: ""
   # The init container assembles the system bundle plus all supplied CA files.
   # It is configured to satisfy the Kubernetes PSA restricted profile.
-  initImage: alpine:3.20
+  initImage:
+    repository: alpine
+    tag: "3.20"
+    pullPolicy: IfNotPresent
+  # Resource requests and limits for the CA bundle init container. These
+  # defaults allow the pod to be admitted by namespace-scoped ResourceQuota.
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+  extraVolumeMounts: []
 existingSecret:
   # When set, this existing Secret supplies OIDC credentials and COOKIE_SECRET.
   # The client ID and secret keys are independently configurable.
@@ -179,6 +193,7 @@ audit:
     args: []
     env: []
     envFrom: []
+    extraVolumeMounts: []
 extraVolumes: []
 extraVolumeMounts: []
 nodeSelector: {}

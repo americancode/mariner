@@ -1,5 +1,6 @@
 apiVersion: apps/v1
 kind: Deployment
+{{- $imageTag := default .Chart.AppVersion .Values.image.tag }}
 metadata:
   name: {{ include "mariner.fullname" . }}
   labels:
@@ -28,8 +29,8 @@ spec:
       {{- if or .Values.caBundle.secretName .Values.caBundle.configMapName }}
       initContainers:
         - name: ca-bundle
-          image: {{ .Values.caBundle.initImage | quote }}
-          imagePullPolicy: IfNotPresent
+          image: "{{ .Values.caBundle.initImage.repository }}:{{ .Values.caBundle.initImage.tag }}"
+          imagePullPolicy: {{ .Values.caBundle.initImage.pullPolicy }}
           command:
             - sh
             - -ec
@@ -48,6 +49,8 @@ spec:
             runAsGroup: 65532
             seccompProfile:
               type: RuntimeDefault
+          resources:
+            {{- toYaml .Values.caBundle.resources | nindent 12 }}
           volumeMounts:
             - name: ca-bundle
               mountPath: /work
@@ -61,10 +64,13 @@ spec:
               mountPath: /etc/mariner-ca/configmap
               readOnly: true
             {{- end }}
+            {{- with .Values.caBundle.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       {{- end }}
       containers:
         - name: mariner
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ $imageTag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
@@ -196,7 +202,7 @@ spec:
             {{- end }}
         {{- if and .Values.audit.enabled .Values.audit.sidecar.enabled }}
         - name: audit-forwarder
-          image: {{ default (printf "%s:%s" .Values.image.repository .Values.image.tag) .Values.audit.sidecar.image | quote }}
+          image: {{ default (printf "%s:%s" .Values.image.repository $imageTag) .Values.audit.sidecar.image | quote }}
           imagePullPolicy: IfNotPresent
           {{- if .Values.audit.sidecar.command }}
           command:
@@ -274,6 +280,9 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
+            {{- with .Values.audit.sidecar.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
         {{- end }}
       volumes:
         - name: data
