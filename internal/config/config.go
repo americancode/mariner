@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 
@@ -28,7 +29,7 @@ func Load() Config {
 	cfg := Config{Addr: value("ADDR", ":8080"), DataDir: value("DATA_DIR", "./data"), DatabaseDriver: databaseDriver, DatabaseURL: databaseURL, AuditAdminGroup: value("AUDIT_ADMIN_GROUP", "admins"), OrganizationEncryptionKey: os.Getenv("MARINER_ORG_ENCRYPTION_KEY"), AuditEnabled: os.Getenv("AUDIT_ENABLED") != "false", OIDCIssuer: os.Getenv("OIDC_ISSUER"), OIDCClientID: os.Getenv("OIDC_CLIENT_ID"), OIDCClientSecret: os.Getenv("OIDC_CLIENT_SECRET"), OIDCRedirectURL: os.Getenv("OIDC_REDIRECT_URL"), CookieSecret: value("COOKIE_SECRET", "change-me-in-production"), OIDCGroupsClaim: value("OIDC_GROUPS_CLAIM", "groups"), OIDCAudienceClaim: value("OIDC_AUDIENCE_CLAIM", "aud"), OIDCAudience: value("OIDC_AUDIENCE", os.Getenv("OIDC_CLIENT_ID")), OIDCNameClaim: value("OIDC_NAME_CLAIM", "name"), OIDCDebugJWT: os.Getenv("OIDC_DEBUG_JWT") == "true"}
 	if raw := os.Getenv("MARINER_ORGANIZATIONS_JSON"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.Organizations); err != nil {
-			panic(fmt.Sprintf("invalid MARINER_ORGANIZATIONS_JSON: %v", err))
+			log.Fatalf("configuration error: invalid MARINER_ORGANIZATIONS_JSON: %v", err)
 		}
 	}
 	for orgName, organization := range cfg.Organizations {
