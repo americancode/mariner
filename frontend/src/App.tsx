@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
@@ -57,6 +57,7 @@ type Activity = {
   state: "active" | "done" | "error";
   error?: string;
 };
+type ActivitySetter = React.Dispatch<React.SetStateAction<Activity[]>>;
 const auditColumns = [
   ["date", "Date"], ["user", "User"], ["action", "Action"],
   ["bucket", "Bucket"], ["object", "Object"], ["result", "Result"],
@@ -83,6 +84,8 @@ export function App() {
   const [connectionDeleteTarget, setConnectionDeleteTarget] =
     useState<Connection>();
   const [darkMode, setDarkMode] = useState(storedThemeIsDark);
+  const currentView = useRef({ activeConnection, prefix, itemFilter });
+  currentView.current = { activeConnection, prefix, itemFilter };
   function setTheme(theme: "light" | "dark") {
     setDarkMode(theme === "dark");
     window.localStorage.setItem(themeStorageKey, theme);
@@ -138,6 +141,30 @@ export function App() {
       setError(errorMessage(err));
     } finally {
       setLoading(false);
+    }
+  }
+  async function refreshCurrentView() {
+    const view = currentView.current;
+    if (!view.activeConnection) return;
+    try {
+      const result = await api.browse(
+        view.activeConnection.id,
+        view.prefix,
+        view.itemFilter,
+      );
+      const latestView = currentView.current;
+      if (
+        latestView.activeConnection?.id !== view.activeConnection.id ||
+        latestView.prefix !== view.prefix ||
+        latestView.itemFilter !== view.itemFilter
+      ) {
+        return;
+      }
+      setItems(result.items);
+      setNextToken(result.nextToken ?? "");
+      setHasMore(result.hasMore);
+    } catch (err) {
+      setError(errorMessage(err));
     }
   }
   async function loadMore() {
@@ -238,9 +265,7 @@ export function App() {
         prefix={prefix}
         items={items}
         onBrowse={browse}
-        onRefresh={() =>
-          activeConnection ? browse(activeConnection, prefix) : Promise.resolve()
-        }
+        onRefresh={refreshCurrentView}
         onError={setError}
         hasMore={hasMore}
         onLoadMore={loadMore}
@@ -663,6 +688,7 @@ function Workspace({
   onUnlock: () => void;
   onFilterChange: (kind: BrowseKind) => void;
 }) {
+  const [activities, setActivities] = useState<Activity[]>([]);
   return (
     <main className="content">
       <header>
@@ -686,6 +712,7 @@ function Workspace({
             connection={connection}
             prefix={prefix}
             items={items}
+            setActivities={setActivities}
             onBrowse={onBrowse}
             onRefresh={onRefresh}
             onError={onError}
@@ -712,6 +739,12 @@ function Workspace({
           )}
         </section>
       )}
+      <ActivityTray
+        activities={activities}
+        onDismiss={(id) =>
+          setActivities((current) => current.filter((item) => item.id !== id))
+        }
+      />
     </main>
   );
 }
@@ -1096,6 +1129,7 @@ function Explorer({
   connection,
   prefix,
   items,
+  setActivities,
   onBrowse,
   onRefresh,
   onError,
@@ -1108,8 +1142,9 @@ function Explorer({
   connection: Connection;
   prefix: string;
   items: Item[];
+  setActivities: ActivitySetter;
   onBrowse: (connection: Connection, prefix?: string) => void;
-  onRefresh: () => void;
+  onRefresh: () => Promise<void>;
   onError: ErrorHandler;
   hasMore: boolean;
   onLoadMore: () => Promise<void>;
@@ -1119,7 +1154,6 @@ function Explorer({
 }) {
   const [folderOpen, setFolderOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
-  const [activities, setActivities] = useState<Activity[]>([]);
   const [deleteTarget, setDeleteTarget] = useState<Item>();
   const [deleteSelectionOpen, setDeleteSelectionOpen] = useState(false);
   const visibleItems = items;
@@ -1207,6 +1241,7 @@ function Explorer({
         label: item?.name || key,
       };
     });
+    if (!pending.length) return;
     setActivities((current) => [
       ...current,
       ...pending.map(({ id, label }) => ({
@@ -1248,6 +1283,7 @@ function Explorer({
       file,
       id: `${Date.now()}-${index}-${file.name}`,
     }));
+    if (!pending.length) return;
     setActivities((current) => [
       ...current,
       ...pending.map(({ file, id }) => ({
@@ -1457,7 +1493,7 @@ function Explorer({
                     : item,
                 ),
               );
-              onRefresh();
+              await onRefresh();
             } catch (err) {
               setActivities((current) =>
                 current.map((item) =>
@@ -1480,12 +1516,6 @@ function Explorer({
           }}
         />
       )}
-      <ActivityTray
-        activities={activities}
-        onDismiss={(id) =>
-          setActivities((current) => current.filter((item) => item.id !== id))
-        }
-      />
     </section>
   );
 }
