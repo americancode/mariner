@@ -134,17 +134,22 @@ helm upgrade --install mariner deploy/helm/mariner \
   --set ingress.hosts[0].host=mariner.example.com
 ```
 
-For production, use `oidc.existingSecret` instead of passing OIDC credentials through Helm values. Configure it as a map with `name`, `clientIdKey`, and `clientSecretKey`; the referenced Secret must also contain `COOKIE_SECRET`:
+For production, use `oidc.existingSecret` instead of passing OIDC credentials through Helm values. Configure it as a map with `name`, `clientIdKey`, `clientSecretKey`, and `cookieSecretKey`:
 
 ```yaml
 oidc:
+  logout:
+    enabled: true
   existingSecret:
     name: oidc-secret
-    clientIdKey: clientId
-    clientSecretKey: clientSecret
+    clientIdKey: OIDC_CLIENT_ID
+    clientSecretKey: OIDC_CLIENT_SECRET
+    cookieSecretKey: COOKIE_SECRET
 ```
 
 An empty object or an empty `name` makes the chart create its release Secret and use `oidc.clientId`/`oidc.clientSecret`. Keep `replicaCount: 1` while using SQLite and a `ReadWriteOnce` volume.
+
+OIDC logout is enabled by default. Mariner clears its local session and then redirects through the provider's discovered `end_session_endpoint`; set `oidc.logout.enabled: false` to perform local-only logout.
 
 ### Organizations and predefined connections
 
@@ -226,7 +231,7 @@ organizationEncryption:
   enabled: true
   existingSecret:
     name: mariner-org-encryption
-    key: encryptionKey
+    key: ENCRYPTION_KEY
 ```
 
 The selected key is injected only into the backend as `MARINER_ORG_ENCRYPTION_KEY`; it is not placed in a ConfigMap or exposed to the browser.

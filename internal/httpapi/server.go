@@ -341,7 +341,6 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		s.audit(session, "auth.logout", "success", nil)
 	}
 	s.Auth.Logout(w, r)
-	http.Redirect(w, r, "/", http.StatusFound)
 }
 func (s *Server) session(r *http.Request) (auth.Session, string, error) {
 	session, id, ok := s.Auth.Current(r)

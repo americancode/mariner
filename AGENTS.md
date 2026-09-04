@@ -54,13 +54,18 @@ Mariner must use the HTTPS issuer and callback:
   in those objects is appended regardless of filename.
 
 OIDC credentials may come from an existing Secret using the map-shaped
-`existingSecret` value. Set `name`, `clientIdKey`, and `clientSecretKey`; the
-Secret must also contain `COOKIE_SECRET`. An empty object or empty `name` uses
+`existingSecret` value. Set `name`, `clientIdKey`, `clientSecretKey`, and
+`cookieSecretKey`; the Secret must contain all selected keys. The defaults are
+`OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, and `COOKIE_SECRET`. An empty object or empty `name` uses
 the chart-managed Secret and `oidc.clientId`/`oidc.clientSecret` values.
 
+OIDC provider logout is enabled by default under `oidc.logout.enabled`; set it
+to false for local-only Mariner logout.
+
 OIDC credentials may come from an existing Secret using the map-shaped
-`existingSecret` value. Set `name`, `clientIdKey`, and `clientSecretKey`; the
-Secret must also contain `COOKIE_SECRET`. An empty object or empty `name` uses
+`existingSecret` value. Set `name`, `clientIdKey`, `clientSecretKey`, and
+`cookieSecretKey`; the Secret must contain all selected keys. The defaults are
+`OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, and `COOKIE_SECRET`. An empty object or empty `name` uses
 the chart-managed Secret and `oidc.clientId`/`oidc.clientSecret` values.
 
 Use `helm upgrade --install` with `image.repository=localhost/mariner`, `image.tag=local`, `image.pullPolicy=Never`, the HTTPS OIDC values, `caBundle.secretName=sslip-io-ca`, and the Traefik service ClusterIP as a host alias for `keycloak.127.0.0.1.sslip.io`.

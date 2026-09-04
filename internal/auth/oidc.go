@@ -10,8 +10,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,21 +40,51 @@ type Service struct {
 	AudienceClaim, Audience string
 	NameClaim               string
 	DebugJWT                bool
+	LogoutEnabled           bool
+	LogoutEndpoint          string
 	sessions                map[string]Session
 	mu                      sync.RWMutex
 }
 
-func New(issuer, clientID, clientSecret, redirect, cookieSecret, groupsClaim, audienceClaim, audience, nameClaim string, debugJWT bool) (*Service, error) {
+func New(issuer, clientID, clientSecret, redirect, cookieSecret, groupsClaim, audienceClaim, audience, nameClaim string, debugJWT, logoutEnabled bool) (*Service, error) {
 	rootCAs, err := tlsconfig.RootCAs()
 	if err != nil {
 		return nil, err
 	}
-	providerContext := oidc.ClientContext(context.Background(), &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: rootCAs}}})
+	httpClient := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: rootCAs}}}
+	providerContext := oidc.ClientContext(context.Background(), httpClient)
+	logoutEndpoint, err := discoverLogoutEndpoint(httpClient, issuer)
+	if err != nil {
+		return nil, fmt.Errorf("OIDC discovery request failed: %w", err)
+	}
 	provider, err := oidc.NewProvider(providerContext, issuer)
 	if err != nil {
 		return nil, fmt.Errorf("OIDC discovery request failed: %w", err)
 	}
-	return &Service{Provider: provider, OAuth: &oauth2.Config{ClientID: clientID, ClientSecret: clientSecret, Endpoint: provider.Endpoint(), RedirectURL: redirect, Scopes: []string{oidc.ScopeOpenID, "profile", "email"}}, CookieSecret: cookieSecret, GroupsClaim: groupsClaim, AudienceClaim: audienceClaim, Audience: audience, NameClaim: nameClaim, DebugJWT: debugJWT, sessions: map[string]Session{}}, nil
+	return &Service{Provider: provider, OAuth: &oauth2.Config{ClientID: clientID, ClientSecret: clientSecret, Endpoint: provider.Endpoint(), RedirectURL: redirect, Scopes: []string{oidc.ScopeOpenID, "profile", "email"}}, CookieSecret: cookieSecret, GroupsClaim: groupsClaim, AudienceClaim: audienceClaim, Audience: audience, NameClaim: nameClaim, DebugJWT: debugJWT, LogoutEnabled: logoutEnabled, LogoutEndpoint: logoutEndpoint, sessions: map[string]Session{}}, nil
+}
+
+func discoverLogoutEndpoint(client *http.Client, issuer string) (string, error) {
+	wellKnown := strings.TrimRight(issuer, "/") + "/.well-known/openid-configuration"
+	resp, err := client.Get(wellKnown)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("discovery returned %s", resp.Status)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	var document struct {
+		EndSessionEndpoint string `json:"end_session_endpoint"`
+	}
+	if err := json.Unmarshal(body, &document); err != nil {
+		return "", fmt.Errorf("invalid discovery document: %w", err)
+	}
+	return document.EndSessionEndpoint, nil
 }
 func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
 	state := random(18)
@@ -164,6 +197,18 @@ func (s *Service) Logout(w http.ResponseWriter, r *http.Request) {
 	delete(s.sessions, id)
 	s.mu.Unlock()
 	s.setCookie(w, "mariner_session", "", -1)
+	if s.LogoutEnabled && s.LogoutEndpoint != "" {
+		logoutURL, err := url.Parse(s.LogoutEndpoint)
+		if err == nil {
+			query := logoutURL.Query()
+			query.Set("client_id", s.OAuth.ClientID)
+			logoutURL.RawQuery = query.Encode()
+			http.Redirect(w, r, logoutURL.String(), http.StatusFound)
+			return
+		}
+		log.Printf("oidc logout redirect unavailable: %v", err)
+	}
+	http.Redirect(w, r, "/", http.StatusFound)
 }
 func (s *Service) setCookie(w http.ResponseWriter, name, value string, age int) {
 	mac := hmac.New(sha256.New, []byte(s.CookieSecret))

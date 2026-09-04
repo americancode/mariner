@@ -78,7 +78,7 @@ organizationEncryption:
   # a new key. Remove the Secret explicitly to rotate it while installed.
   enabled: true
   secretName: ""
-  key: encryptionKey
+  key: ENCRYPTION_KEY
   # Optional fixed key for GitOps/dev deployments. This makes offline Helm
   # renders deterministic; use existingSecret instead for production secrets.
   value: ""
@@ -87,12 +87,16 @@ organizationEncryption:
   # Secret and uses the selected key instead.
   existingSecret:
     name: ""
-    key: encryptionKey
+    key: ENCRYPTION_KEY
 oidc:
   issuer: ""
   clientId: ""
   clientSecret: ""
   redirectUrl: ""
+  logout:
+    # Redirect through the OIDC provider's end-session endpoint after local
+    # Mariner session cleanup. Set false for local-only logout.
+    enabled: true
   # Name of the JWT claim containing organization group values. The claim can
   # be an array of strings or a single string. Defaults to `groups`.
   groupsClaim: groups
@@ -108,12 +112,15 @@ oidc:
   nameClaim: name
   # WARNING: logs the complete ID token and decoded claims. Development only.
   debugJwt: false
-  # When set, this existing Secret supplies OIDC credentials and COOKIE_SECRET.
-  # The client ID and secret keys are independently configurable.
+  # When set, this existing Secret supplies the OIDC client ID, OIDC client
+  # secret, and cookie secret. The selected keys default to
+  # OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, and COOKIE_SECRET and are independently
+  # configurable.
   existingSecret:
     name: ""
-    clientIdKey: clientId
-    clientSecretKey: clientSecret
+    clientIdKey: OIDC_CLIENT_ID
+    clientSecretKey: OIDC_CLIENT_SECRET
+    cookieSecretKey: COOKIE_SECRET
 caBundle:
   # Optional Secret and/or ConfigMap containing one or more PEM CA files.
   # Filenames and keys are not significant; every regular file is appended to

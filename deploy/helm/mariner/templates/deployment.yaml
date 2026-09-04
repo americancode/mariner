@@ -48,7 +48,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "mariner.secretName" . }}
-                  key: COOKIE_SECRET
+                  key: {{ if .Values.oidc.existingSecret.name }}{{ required "oidc.existingSecret.cookieSecretKey is required" .Values.oidc.existingSecret.cookieSecretKey }}{{ else }}COOKIE_SECRET{{ end }}
             - name: OIDC_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
