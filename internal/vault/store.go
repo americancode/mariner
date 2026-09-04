@@ -376,7 +376,9 @@ func (s *Store) ListAudit(filter AuditFilter) (AuditPage, error) {
 		return AuditPage{}, err
 	}
 	defer rows.Close()
-	page := AuditPage{Events: make([]json.RawMessage, 0, limit)}
+	// Avoid allocating from the caller-provided limit. The limit is enforced
+	// above and the result slice can grow only as rows are returned.
+	page := AuditPage{}
 	for rows.Next() {
 		var raw string
 		if err := rows.Scan(&raw); err != nil {

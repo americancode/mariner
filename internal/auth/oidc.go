@@ -217,7 +217,7 @@ func (s *Service) setCookie(w http.ResponseWriter, name, value string, age int) 
 	mac := hmac.New(sha256.New, []byte(s.CookieSecret))
 	mac.Write([]byte(value))
 	signed := value + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	http.SetCookie(w, &http.Cookie{Name: name, Value: signed, Path: "/", MaxAge: age, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: name, Value: signed, Path: "/", MaxAge: age, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
 }
 func (s *Service) cookie(r *http.Request, name string) string {
 	c, err := r.Cookie(name)
