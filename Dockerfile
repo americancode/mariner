@@ -1,8 +1,9 @@
 FROM node:26-alpine AS frontend
 WORKDIR /src/frontend
 COPY frontend/package.json frontend/package-lock.json frontend/tsconfig.json frontend/vite.config.ts frontend/index.html ./
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 COPY frontend/src ./src
-RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund && npm run build
+RUN npm run build
 
 FROM golang:1.27.1 AS build
 WORKDIR /src
