@@ -18,7 +18,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if .Values.serviceAccount.create }}{{ default (include "mariner.fullname" .) .Values.serviceAccount.name }}{{ else }}{{ default "default" .Values.serviceAccount.name }}{{ end }}
 {{- end }}
 {{- define "mariner.secretName" -}}
-{{- default (include "mariner.fullname" .) .Values.existingSecret.name }}
+{{- default (include "mariner.fullname" .) .Values.oidc.existingSecret.name }}
 {{- end }}
 {{- define "mariner.organizationEncryptionSecretName" -}}
 {{- if .Values.organizationEncryption.existingSecret.name }}{{ .Values.organizationEncryption.existingSecret.name }}{{ else }}{{ default (printf "%s-org-encryption" (include "mariner.fullname" .)) .Values.organizationEncryption.secretName | trunc 63 | trimSuffix "-" }}{{ end }}

@@ -1,0 +1,45 @@
+# Local smoke-test values for the published GHCR image and chart.
+# SQLite uses the single ReadWriteOnce PVC to retain the encrypted vault.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/americancode/mariner
+  tag: 1.0.11
+  pullPolicy: IfNotPresent
+
+persistence:
+  enabled: true
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+
+database:
+  driver: sqlite
+
+oidc:
+  issuer: https://keycloak.127.0.0.1.sslip.io/realms/mariner
+  clientId: mariner
+  clientSecret: MarinerClientSecret123!
+  redirectUrl: https://mariner.127.0.0.1.sslip.io/auth/callback
+
+caBundle:
+  secretName: sslip-io-ca
+
+ingress:
+  enabled: true
+  className: traefik
+  hosts:
+    - host: mariner.127.0.0.1.sslip.io
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: sslip-io-tls
+      hosts:
+        - mariner.127.0.0.1.sslip.io
+
+# The local Keycloak hostname resolves through Traefik's ClusterIP in the pod.
+hostAliases:
+  - ip: 10.96.12.74
+    hostnames:
+      - keycloak.127.0.0.1.sslip.io

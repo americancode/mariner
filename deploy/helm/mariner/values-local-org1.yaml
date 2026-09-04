@@ -28,7 +28,6 @@ oidc:
 
 caBundle:
   secretName: sslip-io-ca
-  initImage: alpine:3.20
 
 ingress:
   enabled: true

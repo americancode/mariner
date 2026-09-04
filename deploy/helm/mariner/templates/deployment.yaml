@@ -26,48 +26,6 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- if or .Values.caBundle.secretName .Values.caBundle.configMapName }}
-      initContainers:
-        - name: ca-bundle
-          image: "{{ .Values.caBundle.initImage.repository }}:{{ .Values.caBundle.initImage.tag }}"
-          imagePullPolicy: {{ .Values.caBundle.initImage.pullPolicy }}
-          command:
-            - sh
-            - -ec
-            - >-
-              cp /etc/ssl/certs/ca-certificates.crt /work/ca-certificates.crt
-              && printf '\n' >> /work/ca-certificates.crt
-              && if [ -d /etc/mariner-ca/secret ]; then for file in /etc/mariner-ca/secret/*; do cat "$file" >> /work/ca-certificates.crt; printf '\n' >> /work/ca-certificates.crt; done; fi
-              && if [ -d /etc/mariner-ca/configmap ]; then for file in /etc/mariner-ca/configmap/*; do cat "$file" >> /work/ca-certificates.crt; printf '\n' >> /work/ca-certificates.crt; done; fi
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: [ALL]
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65532
-            runAsGroup: 65532
-            seccompProfile:
-              type: RuntimeDefault
-          resources:
-            {{- toYaml .Values.caBundle.resources | nindent 12 }}
-          volumeMounts:
-            - name: ca-bundle
-              mountPath: /work
-            {{- if .Values.caBundle.secretName }}
-            - name: ca-input-secret
-              mountPath: /etc/mariner-ca/secret
-              readOnly: true
-            {{- end }}
-            {{- if .Values.caBundle.configMapName }}
-            - name: ca-input-configmap
-              mountPath: /etc/mariner-ca/configmap
-              readOnly: true
-            {{- end }}
-            {{- with .Values.caBundle.extraVolumeMounts }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
-      {{- end }}
       containers:
         - name: mariner
           image: "{{ .Values.image.repository }}:{{ $imageTag }}"
@@ -95,13 +53,13 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "mariner.secretName" . }}
-                  key: {{ if .Values.existingSecret.name }}{{ required "existingSecret.clientSecretKey is required" .Values.existingSecret.clientSecretKey }}{{ else }}OIDC_CLIENT_SECRET{{ end }}
+                  key: {{ if .Values.oidc.existingSecret.name }}{{ required "oidc.existingSecret.clientSecretKey is required" .Values.oidc.existingSecret.clientSecretKey }}{{ else }}OIDC_CLIENT_SECRET{{ end }}
             - name: OIDC_CLIENT_ID
-              {{- if .Values.existingSecret.name }}
+              {{- if .Values.oidc.existingSecret.name }}
               valueFrom:
                 secretKeyRef:
                   name: {{ include "mariner.secretName" . }}
-                  key: {{ required "existingSecret.clientIdKey is required" .Values.existingSecret.clientIdKey }}
+                  key: {{ required "oidc.existingSecret.clientIdKey is required" .Values.oidc.existingSecret.clientIdKey }}
               {{- else }}
               value: {{ required "oidc.clientId is required when existingSecret.name is empty" .Values.oidc.clientId | quote }}
               {{- end }}
@@ -170,8 +128,14 @@ spec:
             {{- end }}
             {{- end }}
             {{- if or .Values.caBundle.secretName .Values.caBundle.configMapName }}
-            - name: SSL_CERT_FILE
-              value: /etc/mariner-ca-bundle/ca-certificates.crt
+            - name: SSL_CERT_DIR
+              {{- if and .Values.caBundle.secretName .Values.caBundle.configMapName }}
+              value: "/etc/mariner-ca/secret:/etc/mariner-ca/configmap"
+              {{- else if .Values.caBundle.secretName }}
+              value: "/etc/mariner-ca/secret"
+              {{- else }}
+              value: "/etc/mariner-ca/configmap"
+              {{- end }}
             {{- end }}
           readinessProbe:
             httpGet:
@@ -192,9 +156,14 @@ spec:
               mountPath: /data
             - name: tmp
               mountPath: /tmp
-            {{- if or .Values.caBundle.secretName .Values.caBundle.configMapName }}
-            - name: ca-bundle
-              mountPath: /etc/mariner-ca-bundle
+            {{- if .Values.caBundle.secretName }}
+            - name: ca-input-secret
+              mountPath: /etc/mariner-ca/secret
+              readOnly: true
+            {{- end }}
+            {{- if .Values.caBundle.configMapName }}
+            - name: ca-input-configmap
+              mountPath: /etc/mariner-ca/configmap
               readOnly: true
             {{- end }}
             {{- with .Values.extraVolumeMounts }}
@@ -221,6 +190,10 @@ spec:
               value: {{ default "postgres" .Values.database.driver | quote }}
             - name: DATA_DIR
               value: /data
+            - name: AUDIT_FORWARDER_POLLING_INTERVAL
+              value: {{ default "2s" .Values.audit.sidecar.pollingInterval | quote }}
+            - name: AUDIT_FORWARDER_BATCH_SIZE
+              value: {{ default 100 .Values.audit.sidecar.batchSize | quote }}
             {{- if and .Values.database.existingSecret.name .Values.database.existingSecret.urlKey }}
             - name: DATABASE_URL
               valueFrom:
@@ -294,7 +267,6 @@ spec:
           {{- end }}
         - name: tmp
           emptyDir: {}
-        {{- if or .Values.caBundle.secretName .Values.caBundle.configMapName }}
         {{- if .Values.caBundle.secretName }}
         - name: ca-input-secret
           secret:
@@ -304,9 +276,6 @@ spec:
         - name: ca-input-configmap
           configMap:
             name: {{ .Values.caBundle.configMapName }}
-        {{- end }}
-        - name: ca-bundle
-          emptyDir: {}
         {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}

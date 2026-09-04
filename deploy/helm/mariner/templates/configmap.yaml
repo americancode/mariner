@@ -7,7 +7,7 @@ metadata:
 data:
   DATABASE_DRIVER: {{ default "postgres" .Values.database.driver | quote }}
   AUDIT_ENABLED: {{ default true .Values.audit.enabled | quote }}
-  AUDIT_ADMIN_GROUP: {{ default "admins" .Values.audit.adminGroup | quote }}
+  AUDIT_ADMIN_GROUP: {{ default (default "admins" .Values.audit.adminGroup) .Values.oidc.adminGroup | quote }}
   OIDC_ISSUER: {{ required "oidc.issuer is required" .Values.oidc.issuer | quote }}
   OIDC_CLIENT_ID: {{ default "" .Values.oidc.clientId | quote }}
   OIDC_REDIRECT_URL: {{ required "oidc.redirectUrl is required" .Values.oidc.redirectUrl | quote }}

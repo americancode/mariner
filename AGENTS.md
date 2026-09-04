@@ -46,10 +46,10 @@ Mariner must use the HTTPS issuer and callback:
 
 - Issuer: `https://keycloak.127.0.0.1.sslip.io/realms/mariner`
 - Callback: `https://mariner.127.0.0.1.sslip.io/auth/callback`
-- CA trust secret in the Mariner namespace: `sslip-io-ca`. The chart appends
-  its `tls.crt` to the image system CA bundle in a PSA-restricted init
-  container; public roots remain trusted, and the resulting global bundle is
-  used for both OIDC and S3 TLS. Configure it with top-level
+- CA trust secret in the Mariner namespace: `sslip-io-ca`. The chart mounts
+  custom CA files directly into the Mariner container; the application
+  appends them to the platform system CA pool, so public roots remain trusted
+  and the combined pool is used for both OIDC and S3 TLS. Configure it with top-level
   `caBundle.secretName` and/or `caBundle.configMapName`; every regular file
   in those objects is appended regardless of filename.
 

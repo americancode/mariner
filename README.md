@@ -96,15 +96,19 @@ extraVolumeMounts:
     readOnly: true
 ```
 
-These mounts are added to the Mariner container. The audit sidecar already
-shares `/data`; custom sidecar-specific mounts can be added in a future
-sidecar-specific hook if required by the shipper image.
+`extraVolumes` is pod-scoped and is available to all containers. `extraVolumeMounts`
+and `audit.sidecar.extraVolumeMounts` add mounts to the Mariner container and audit
+sidecar respectively. CA files configured through `caBundle.secretName` or
+`caBundle.configMapName` are mounted directly into Mariner and combined with the
+platform trust pool by the application. The chart keeps its containers under the
+restricted security context; custom volume types and mount settings must also
+comply with the cluster's PSA policy.
 
 Audit events use `log_type=audit` at the ingestion boundary and must not contain passwords, S3 secrets, JWTs, cookies, or object contents. Successful object upload, replace, and delete events include the SHA-256 digest of the exact object bytes. PostgreSQL is the durable audit record; Loki is the searchable operational copy. PostgreSQL-backed deployments do not require the application PVC; enable `persistence.enabled` when using SQLite so its vault survives restarts.
 
 #### Audit administration
 
-Authenticated users in the OIDC group configured by `audit.adminGroup`
+Authenticated users in the OIDC group configured by `oidc.adminGroup`
 (default `admins`) can open `https://mariner.example.com/admin`. The page
 loads audit events through `/api/admin/audit`; user, bucket, action, and date
 filters are applied by SQL before the paginated results are returned. The UI
@@ -130,13 +134,14 @@ helm upgrade --install mariner deploy/helm/mariner \
   --set ingress.hosts[0].host=mariner.example.com
 ```
 
-For production, use `existingSecret` instead of passing OIDC credentials through Helm values. Configure it as a map with `name`, `clientIdKey`, and `clientSecretKey`; the referenced Secret must also contain `COOKIE_SECRET`:
+For production, use `oidc.existingSecret` instead of passing OIDC credentials through Helm values. Configure it as a map with `name`, `clientIdKey`, and `clientSecretKey`; the referenced Secret must also contain `COOKIE_SECRET`:
 
 ```yaml
-existingSecret:
-  name: oidc-secret
-  clientIdKey: clientId
-  clientSecretKey: clientSecret
+oidc:
+  existingSecret:
+    name: oidc-secret
+    clientIdKey: clientId
+    clientSecretKey: clientSecret
 ```
 
 An empty object or an empty `name` makes the chart create its release Secret and use `oidc.clientId`/`oidc.clientSecret`. Keep `replicaCount: 1` while using SQLite and a `ReadWriteOnce` volume.
@@ -210,7 +215,7 @@ Hyphens are converted to underscores and names are uppercased. The application u
 
 The Secret must exist in the Mariner release namespace and contain the keys named by `accessKeyKey` and `secretKeyKey` (default names are `accessKey` and `secretKey`). If an ExternalSecret creates the Secret, install or sync it before starting Mariner. Secret rotation requires the pod to restart because credentials are loaded from environment variables at process startup.
 
-The chart also manages the organization encryption key. By default it creates a release-scoped immutable Secret named `<release>-mariner-org-encryption`, using the `encryptionKey` key, and marks it `helm.sh/resource-policy: keep`. Helm generates the value only when the Secret does not already exist; upgrades and uninstall/reinstall operations preserve it. Rotate it only by deliberately deleting the Secret and redeploying, because changing the key can make encrypted organization data unreadable. If the existing managed Secret is missing the configured key, the upgrade fails instead of generating a replacement.
+The chart also manages the organization encryption key. By default it creates a release-scoped immutable Secret named `<release>-mariner-org-encryption`, using the `encryptionKey` key. Helm generates the value on install and reuses it on upgrades; if the Secret is missing during an upgrade, the upgrade fails instead of generating a replacement. Uninstalling the release deletes the chart-managed Secret, so a later fresh install generates a new key. Rotate it only deliberately, because changing the key can make encrypted organization data unreadable.
 
 To use a Secret managed by ExternalSecrets or another platform, set `organizationEncryption.existingSecret.name` and `organizationEncryption.existingSecret.key`. Helm will then reference the Secret without creating or owning it:
 

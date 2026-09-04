@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -48,7 +49,7 @@ func New(issuer, clientID, clientSecret, redirect, cookieSecret, groupsClaim, au
 	providerContext := oidc.ClientContext(context.Background(), &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: rootCAs}}})
 	provider, err := oidc.NewProvider(providerContext, issuer)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("OIDC discovery request failed: %w", err)
 	}
 	return &Service{Provider: provider, OAuth: &oauth2.Config{ClientID: clientID, ClientSecret: clientSecret, Endpoint: provider.Endpoint(), RedirectURL: redirect, Scopes: []string{oidc.ScopeOpenID, "profile", "email"}}, CookieSecret: cookieSecret, GroupsClaim: groupsClaim, AudienceClaim: audienceClaim, Audience: audience, NameClaim: nameClaim, DebugJWT: debugJWT, sessions: map[string]Session{}}, nil
 }

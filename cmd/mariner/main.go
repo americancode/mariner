@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"mariner/internal/audit"
@@ -30,7 +29,7 @@ func main() {
 	defer store.Close()
 	store.SetOrganizationEncryptionKey(cfg.OrganizationEncryptionKey)
 	if len(os.Args) > 1 && os.Args[1] == "audit-forwarder" {
-		log.Fatal(audit.RunForwarder(context.Background(), store, 2*time.Second))
+		log.Fatal(audit.RunForwarder(context.Background(), store, cfg.AuditForwarderPollingInterval, cfg.AuditForwarderBatchSize))
 	}
 	var auditLogger *audit.Logger
 	if cfg.AuditEnabled {

@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"time"
 
 	"mariner/internal/vault"
 )
@@ -15,6 +16,8 @@ type OrganizationConnection = vault.OrganizationConnection
 
 type Config struct {
 	Addr, DataDir, DatabaseDriver, DatabaseURL, AuditAdminGroup, OrganizationEncryptionKey, OIDCIssuer, OIDCClientID, OIDCClientSecret, OIDCRedirectURL, CookieSecret, OIDCGroupsClaim, OIDCAudienceClaim, OIDCAudience, OIDCNameClaim string
+	AuditForwarderPollingInterval                                                                                                                                                                                                      time.Duration
+	AuditForwarderBatchSize                                                                                                                                                                                                            int
 	AuditEnabled                                                                                                                                                                                                                       bool
 	OIDCDebugJWT                                                                                                                                                                                                                       bool
 	Organizations                                                                                                                                                                                                                      map[string]Organization
@@ -26,7 +29,7 @@ func Load() Config {
 	if databaseURL == "" && databaseDriver == "postgres" {
 		databaseURL = postgresURL()
 	}
-	cfg := Config{Addr: value("ADDR", ":8080"), DataDir: value("DATA_DIR", "./data"), DatabaseDriver: databaseDriver, DatabaseURL: databaseURL, AuditAdminGroup: value("AUDIT_ADMIN_GROUP", "admins"), OrganizationEncryptionKey: os.Getenv("MARINER_ORG_ENCRYPTION_KEY"), AuditEnabled: os.Getenv("AUDIT_ENABLED") != "false", OIDCIssuer: os.Getenv("OIDC_ISSUER"), OIDCClientID: os.Getenv("OIDC_CLIENT_ID"), OIDCClientSecret: os.Getenv("OIDC_CLIENT_SECRET"), OIDCRedirectURL: os.Getenv("OIDC_REDIRECT_URL"), CookieSecret: value("COOKIE_SECRET", "change-me-in-production"), OIDCGroupsClaim: value("OIDC_GROUPS_CLAIM", "groups"), OIDCAudienceClaim: value("OIDC_AUDIENCE_CLAIM", "aud"), OIDCAudience: value("OIDC_AUDIENCE", os.Getenv("OIDC_CLIENT_ID")), OIDCNameClaim: value("OIDC_NAME_CLAIM", "name"), OIDCDebugJWT: os.Getenv("OIDC_DEBUG_JWT") == "true"}
+	cfg := Config{Addr: value("ADDR", ":8080"), DataDir: value("DATA_DIR", "./data"), DatabaseDriver: databaseDriver, DatabaseURL: databaseURL, AuditAdminGroup: value("AUDIT_ADMIN_GROUP", "admins"), OrganizationEncryptionKey: os.Getenv("MARINER_ORG_ENCRYPTION_KEY"), AuditForwarderPollingInterval: durationValue("AUDIT_FORWARDER_POLLING_INTERVAL", 2*time.Second), AuditForwarderBatchSize: valueInt("AUDIT_FORWARDER_BATCH_SIZE", 100), AuditEnabled: os.Getenv("AUDIT_ENABLED") != "false", OIDCIssuer: os.Getenv("OIDC_ISSUER"), OIDCClientID: os.Getenv("OIDC_CLIENT_ID"), OIDCClientSecret: os.Getenv("OIDC_CLIENT_SECRET"), OIDCRedirectURL: os.Getenv("OIDC_REDIRECT_URL"), CookieSecret: value("COOKIE_SECRET", "change-me-in-production"), OIDCGroupsClaim: value("OIDC_GROUPS_CLAIM", "groups"), OIDCAudienceClaim: value("OIDC_AUDIENCE_CLAIM", "aud"), OIDCAudience: value("OIDC_AUDIENCE", os.Getenv("OIDC_CLIENT_ID")), OIDCNameClaim: value("OIDC_NAME_CLAIM", "name"), OIDCDebugJWT: os.Getenv("OIDC_DEBUG_JWT") == "true"}
 	if raw := os.Getenv("MARINER_ORGANIZATIONS_JSON"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.Organizations); err != nil {
 			log.Fatalf("configuration error: invalid MARINER_ORGANIZATIONS_JSON: %v", err)
@@ -94,5 +97,18 @@ func valueInt(key string, fallback int) int {
 			return parsed
 		}
 	}
+	return fallback
+}
+
+func durationValue(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(v)
+	if err == nil && parsed > 0 {
+		return parsed
+	}
+	log.Fatalf("configuration error: %s must be a positive duration, got %q", key, v)
 	return fallback
 }

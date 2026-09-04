@@ -4,6 +4,27 @@ image:
   # Empty uses the chart's appVersion.
   tag: ""
   pullPolicy: IfNotPresent
+# Container requests and limits are configurable per environment. These
+# conservative defaults keep the chart schedulable in a local kind cluster.
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+podSecurityContext:
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
 serviceAccount:
   create: true
   automount: true
@@ -24,6 +45,46 @@ ingress:
     - secretName: sslip-io-tls
       hosts:
         - mariner.127.0.0.1.sslip.io
+database:
+  # postgres is the default. Set driver: sqlite for lightweight
+  # single-replica deployments.
+  driver: postgres
+  url: ""
+  # PostgreSQL TLS mode is chart configuration, not a database Secret field.
+  # Examples: disable, require, verify-ca, or verify-full.
+  sslMode: disable
+  existingSecret:
+    name: ""
+    # A URL key may be used by setting urlKey and leaving the field selectors
+    # empty. Otherwise Mariner assembles a URL from these independently named
+    # Secret keys. Host, database, username, and password are required.
+    urlKey: ""
+    hostKey: host
+    portKey: port
+    databaseKey: database
+    usernameKey: username
+    passwordKey: password
+persistence:
+  # PostgreSQL-backed deployments do not need a shared application PVC.
+  # Set true when using SQLite and retaining the vault across restarts.
+  enabled: false
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+  size: 1Gi
+  annotations: {}
+organizationEncryption:
+  # The chart creates this once and preserves it on upgrades. Uninstalling
+  # the release deletes the chart-managed Secret; a fresh install generates
+  # a new key. Remove the Secret explicitly to rotate it while installed.
+  enabled: true
+  secretName: ""
+  key: encryptionKey
+  # Set existingSecret.name to use a Secret managed outside Helm (for
+  # example by ExternalSecrets). When set, the chart does not create a
+  # Secret and uses the selected key instead.
+  existingSecret:
+    name: ""
+    key: encryptionKey
 oidc:
   issuer: ""
   clientId: ""
@@ -32,6 +93,9 @@ oidc:
   # Name of the JWT claim containing organization group values. The claim can
   # be an array of strings or a single string. Defaults to `groups`.
   groupsClaim: groups
+  # OIDC group required for Mariner administrator access, including the admin
+  # UI, organization management, and audit history.
+  adminGroup: admins
   # Audience validation defaults to the standard `aud` claim and clientId.
   # Set both for providers that use a different audience claim, such as ADFS.
   audienceClaim: aud
@@ -41,6 +105,12 @@ oidc:
   nameClaim: name
   # WARNING: logs the complete ID token and decoded claims. Development only.
   debugJwt: false
+  # When set, this existing Secret supplies OIDC credentials and COOKIE_SECRET.
+  # The client ID and secret keys are independently configurable.
+  existingSecret:
+    name: ""
+    clientIdKey: clientId
+    clientSecretKey: clientSecret
 caBundle:
   # Optional Secret and/or ConfigMap containing one or more PEM CA files.
   # Filenames and keys are not significant; every regular file is appended to
@@ -48,29 +118,24 @@ caBundle:
   # This global bundle is used for OIDC and S3 TLS.
   secretName: ""
   configMapName: ""
-  # The init container assembles the system bundle plus all supplied CA files.
-  # It is configured to satisfy the Kubernetes PSA restricted profile.
-  initImage:
-    repository: alpine
-    tag: "3.20"
-    pullPolicy: IfNotPresent
-  # Resource requests and limits for the CA bundle init container. These
-  # defaults allow the pod to be admitted by namespace-scoped ResourceQuota.
-  resources:
-    requests:
-      cpu: 10m
-      memory: 16Mi
-    limits:
-      cpu: 100m
-      memory: 64Mi
-  extraVolumeMounts: []
-existingSecret:
-  # When set, this existing Secret supplies OIDC credentials and COOKIE_SECRET.
-  # The client ID and secret keys are independently configurable.
-  name: ""
-  clientIdKey: clientId
-  clientSecretKey: clientSecret
+  # Custom CA files are mounted directly into the Mariner container and
+  # appended to the platform trust pool by tlsconfig.RootCAs.
 cookieSecret: ""
+audit:
+  enabled: true
+  sidecar:
+    # The default polls the database for new audit rows and writes their exact
+    # event_json to stdout for Alloy/Loki. Replace image/command/args for a
+    # direct Splunk HEC shipper.
+    enabled: true
+    pollingInterval: 2s
+    batchSize: 100
+    image: ""
+    command: []
+    args: []
+    env: []
+    envFrom: []
+    extraVolumeMounts: []
 # Organizations are selected from the OIDC ID token claim configured by
 # `oidc.groupsClaim` (which defaults to `groups`).
 # A user is granted an organization when at least one token group matches at
@@ -131,69 +196,6 @@ organizations: {}
 #           remoteRef:
 #             key: s3/engineering/secret-key
 extraObjects: []
-persistence:
-  # PostgreSQL-backed deployments do not need a shared application PVC.
-  # Set true when using SQLite and retaining the vault across restarts.
-  enabled: false
-  storageClass: ""
-  accessModes: [ReadWriteOnce]
-  size: 1Gi
-  annotations: {}
-# Container requests and limits are configurable per environment. These
-# conservative defaults keep the chart schedulable in a local kind cluster.
-resources:
-  requests:
-    cpu: 10m
-    memory: 32Mi
-  limits:
-    cpu: 500m
-    memory: 256Mi
-database:
-  # postgres is the default. Set driver: sqlite for lightweight
-  # single-replica deployments.
-  driver: postgres
-  url: ""
-  # PostgreSQL TLS mode is chart configuration, not a database Secret field.
-  # Examples: disable, require, verify-ca, or verify-full.
-  sslMode: disable
-  existingSecret:
-    name: ""
-    # A URL key may be used by setting urlKey and leaving the field selectors
-    # empty. Otherwise Mariner assembles a URL from these independently named
-    # Secret keys. Host, database, username, and password are required.
-    urlKey: ""
-    hostKey: host
-    portKey: port
-    databaseKey: database
-    usernameKey: username
-    passwordKey: password
-organizationEncryption:
-  # The chart creates this once and preserves it on upgrades and
-  # uninstall/reinstall. Remove the Secret explicitly to rotate it.
-  enabled: true
-  secretName: ""
-  key: encryptionKey
-  # Set existingSecret.name to use a Secret managed outside Helm (for
-  # example by ExternalSecrets). When set, the chart does not create a
-  # Secret and uses the selected key instead.
-  existingSecret:
-    name: ""
-    key: encryptionKey
-audit:
-  enabled: true
-  # Users must have this exact OIDC group to access /admin audit history.
-  adminGroup: admins
-  sidecar:
-    # The default polls the database for new audit rows and writes their exact
-    # event_json to stdout for Alloy/Loki. Replace image/command/args for a
-    # direct Splunk HEC shipper.
-    enabled: true
-    image: ""
-    command: []
-    args: []
-    env: []
-    envFrom: []
-    extraVolumeMounts: []
 extraVolumes: []
 extraVolumeMounts: []
 nodeSelector: {}
@@ -201,15 +203,3 @@ tolerations: []
 affinity: {}
 podAnnotations: {}
 hostAliases: []
-podSecurityContext:
-  fsGroup: 65532
-  seccompProfile:
-    type: RuntimeDefault
-securityContext:
-  allowPrivilegeEscalation: false
-  capabilities:
-    drop: [ALL]
-  readOnlyRootFilesystem: true
-  runAsNonRoot: true
-  runAsUser: 65532
-  runAsGroup: 65532
