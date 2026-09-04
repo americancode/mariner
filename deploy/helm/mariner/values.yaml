@@ -93,6 +93,12 @@ oidc:
   clientId: ""
   clientSecret: ""
   redirectUrl: ""
+  # OAuth scopes requested during login. Supplying a list replaces these
+  # defaults; include openid when the provider should return an ID token.
+  scopes:
+    - openid
+    - profile
+    - email
   logout:
     # Redirect through the OIDC provider's end-session endpoint after local
     # Mariner session cleanup. Set false for local-only logout.

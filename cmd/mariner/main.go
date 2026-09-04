@@ -39,7 +39,7 @@ func main() {
 	if cfg.OIDCIssuer == "" {
 		log.Fatal("configuration error: OIDC_ISSUER is required")
 	}
-	authService, err := auth.New(cfg.OIDCIssuer, cfg.OIDCClientID, cfg.OIDCClientSecret, cfg.OIDCRedirectURL, cfg.CookieSecret, cfg.OIDCGroupsClaim, cfg.OIDCAudienceClaim, cfg.OIDCAudience, cfg.OIDCNameClaim, cfg.OIDCDebugJWT, cfg.OIDCLogoutEnabled)
+	authService, err := auth.New(cfg.OIDCIssuer, cfg.OIDCClientID, cfg.OIDCClientSecret, cfg.OIDCRedirectURL, cfg.CookieSecret, cfg.OIDCGroupsClaim, cfg.OIDCAudienceClaim, cfg.OIDCAudience, cfg.OIDCNameClaim, cfg.OIDCScopes, cfg.OIDCDebugJWT, cfg.OIDCLogoutEnabled)
 	if err != nil {
 		discoveryURL := strings.TrimRight(cfg.OIDCIssuer, "/") + "/.well-known/openid-configuration"
 		log.Fatalf("OIDC initialization failed (issuer=%s, discovery=%s): %v", cfg.OIDCIssuer, discoveryURL, err)

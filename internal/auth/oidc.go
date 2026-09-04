@@ -46,7 +46,10 @@ type Service struct {
 	mu                      sync.RWMutex
 }
 
-func New(issuer, clientID, clientSecret, redirect, cookieSecret, groupsClaim, audienceClaim, audience, nameClaim string, debugJWT, logoutEnabled bool) (*Service, error) {
+func New(issuer, clientID, clientSecret, redirect, cookieSecret, groupsClaim, audienceClaim, audience, nameClaim string, scopes []string, debugJWT, logoutEnabled bool) (*Service, error) {
+	if len(scopes) == 0 {
+		scopes = []string{oidc.ScopeOpenID, "profile", "email"}
+	}
 	rootCAs, err := tlsconfig.RootCAs()
 	if err != nil {
 		return nil, err
@@ -61,7 +64,7 @@ func New(issuer, clientID, clientSecret, redirect, cookieSecret, groupsClaim, au
 	if err != nil {
 		return nil, fmt.Errorf("OIDC discovery request failed: %w", err)
 	}
-	return &Service{Provider: provider, OAuth: &oauth2.Config{ClientID: clientID, ClientSecret: clientSecret, Endpoint: provider.Endpoint(), RedirectURL: redirect, Scopes: []string{oidc.ScopeOpenID, "profile", "email"}}, CookieSecret: cookieSecret, GroupsClaim: groupsClaim, AudienceClaim: audienceClaim, Audience: audience, NameClaim: nameClaim, DebugJWT: debugJWT, LogoutEnabled: logoutEnabled, LogoutEndpoint: logoutEndpoint, sessions: map[string]Session{}}, nil
+	return &Service{Provider: provider, OAuth: &oauth2.Config{ClientID: clientID, ClientSecret: clientSecret, Endpoint: provider.Endpoint(), RedirectURL: redirect, Scopes: scopes}, CookieSecret: cookieSecret, GroupsClaim: groupsClaim, AudienceClaim: audienceClaim, Audience: audience, NameClaim: nameClaim, DebugJWT: debugJWT, LogoutEnabled: logoutEnabled, LogoutEndpoint: logoutEndpoint, sessions: map[string]Session{}}, nil
 }
 
 func discoverLogoutEndpoint(client *http.Client, issuer string) (string, error) {

@@ -18,7 +18,7 @@ go run ./cmd/mariner
 
 For frontend development, run `cd frontend && npm install && npm run dev`. The production container builds the frontend with Vite and serves it from `/web`.
 
-The OIDC client needs the `openid`, `profile`, and `email` scopes and the callback URL above. `DATA_DIR` defaults to `./data`; it contains the SQLite database `mariner.db`, with encrypted vault envelopes keyed by user. Back it up with appropriate permissions. On first sign-in, choose a master password of at least 10 characters. The server cannot recover it.
+The OIDC client defaults to requesting the `openid`, `profile`, and `email` scopes and uses the callback URL above. Helm deployments can replace this list with `oidc.scopes`. `DATA_DIR` defaults to `./data`; it contains the SQLite database `mariner.db`, with encrypted vault envelopes keyed by user. Back it up with appropriate permissions. On first sign-in, choose a master password of at least 10 characters. The server cannot recover it.
 
 ### Database and audit storage
 

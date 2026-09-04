@@ -14,10 +14,12 @@ spec:
     metadata:
       labels:
         {{- include "mariner.selectorLabels" . | nindent 8 }}
-      {{- with .Values.podAnnotations }}
       annotations:
+      {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
       {{- end }}
+        {{- $configValues := dict "database" .Values.database "audit" .Values.audit "oidc" .Values.oidc "organizations" .Values.organizations }}
+        checksum/config-values: {{ toJson $configValues | sha256sum }}
     spec:
       serviceAccountName: {{ include "mariner.serviceAccountName" . }}
       {{- with .Values.hostAliases }}
