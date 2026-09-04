@@ -84,7 +84,6 @@ jobs:
   build-quarantine:
     name: Build and scan quarantine image
     runs-on: ubuntu-latest
-    needs: validate
     outputs:
       digest: ${{ steps.image.outputs.digest }}
     permissions:
