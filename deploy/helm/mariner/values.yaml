@@ -79,6 +79,9 @@ organizationEncryption:
   enabled: true
   secretName: ""
   key: encryptionKey
+  # Optional fixed key for GitOps/dev deployments. This makes offline Helm
+  # renders deterministic; use existingSecret instead for production secrets.
+  value: ""
   # Set existingSecret.name to use a Secret managed outside Helm (for
   # example by ExternalSecrets). When set, the chart does not create a
   # Secret and uses the selected key instead.

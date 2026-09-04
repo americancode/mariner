@@ -217,6 +217,8 @@ The Secret must exist in the Mariner release namespace and contain the keys name
 
 The chart also manages the organization encryption key. By default it creates a release-scoped immutable Secret named `<release>-mariner-org-encryption`, using the `encryptionKey` key. Helm generates the value on install and reuses it on upgrades; if the Secret is missing during an upgrade, the upgrade fails instead of generating a replacement. Uninstalling the release deletes the chart-managed Secret, so a later fresh install generates a new key. Rotate it only deliberately, because changing the key can make encrypted organization data unreadable.
 
+For development or GitOps configurations where a fixed value is acceptable, set `organizationEncryption.value`. This takes precedence over generation and makes offline Helm renders deterministic. Do not use a raw value in production Git; use `organizationEncryption.existingSecret` with a Sealed Secret, External Secret, or other secret manager instead.
+
 To use a Secret managed by ExternalSecrets or another platform, set `organizationEncryption.existingSecret.name` and `organizationEncryption.existingSecret.key`. Helm will then reference the Secret without creating or owning it:
 
 ```yaml
