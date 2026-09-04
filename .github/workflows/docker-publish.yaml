@@ -1,17 +1,15 @@
-name: Build, scan, and release
+name: CI Image
 
 on:
   push:
-    branches: [main]
-    tags:
-      - "[0-9]+.[0-9]+.[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+"
+    branches: ["main"]
+    tags: ["[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+"]
   pull_request:
-    branches: [main]
+    branches: ["main"]
   workflow_dispatch:
 
 concurrency:
-  group: mariner-${{ github.ref }}
+  group: ci-image-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
