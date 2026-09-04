@@ -46,9 +46,18 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+      - name: Review dependency changes
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: high
+          license-check: false
+
       - name: Scan frontend packages
         working-directory: frontend
-        run: npm ci && npm audit --audit-level=high
+        run: |
+          npm ci --no-audit --no-fund
+          npm audit --audit-level=high --package-lock-only
 
       - name: Scan Go packages
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
