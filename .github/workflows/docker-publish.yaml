@@ -40,7 +40,7 @@ jobs:
           exit-code: 1
 
       - name: Install Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
