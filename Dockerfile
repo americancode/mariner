@@ -4,7 +4,7 @@ COPY frontend/package.json frontend/package-lock.json frontend/tsconfig.json fro
 COPY frontend/src ./src
 RUN npm ci && npm run build
 
-FROM golang:1.26.6 AS build
+FROM golang:1.27.1 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
