@@ -1,18 +1,23 @@
-FROM node:26-alpine AS frontend
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+
+FROM --platform=${BUILDPLATFORM} node:26-alpine AS frontend
 WORKDIR /src/frontend
 COPY frontend/package.json frontend/package-lock.json frontend/tsconfig.json frontend/vite.config.ts frontend/index.html ./
 RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 COPY frontend/src ./src
 RUN npm run build
 
-FROM golang:1.27.1 AS build
+FROM --platform=${BUILDPLATFORM} golang:1.27.1 AS build
 WORKDIR /src
+ARG TARGETOS
+ARG TARGETARCH
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/mariner ./cmd/mariner
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -trimpath -ldflags='-s -w' -o /out/mariner ./cmd/mariner
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM --platform=${TARGETPLATFORM} gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/mariner /mariner
 COPY --from=frontend /src/frontend/dist /web
 EXPOSE 8080
