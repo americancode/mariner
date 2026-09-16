@@ -26,7 +26,31 @@ Traefik is installed with Helm. cert-manager is installed with Helm. Keycloak, P
 
 ## Deploy
 
-Build and load the local image:
+For a clean, fully provisioned local environment, use the rebuild wrapper:
+
+```sh
+./scripts/rebuild-local.sh
+```
+
+This deletes and recreates the `mariner` kind cluster, installs Traefik and
+cert-manager, builds and loads the image, applies PostgreSQL/Keycloak/MinIO,
+creates the local CA and TLS certificates, provisions MinIO buckets/users/
+policies, configures the ORG1 test users, and installs Mariner.
+
+The wrapper defaults to one Mariner replica. To exercise shared PostgreSQL
+sessions and multipart state across pods:
+
+```sh
+MARINER_REPLICAS=2 ./scripts/rebuild-local.sh
+```
+
+`scripts/kind-clear.sh` is destructive and removes only the named kind
+cluster. `scripts/kind-up.sh` creates the cluster without deploying services.
+Use `scripts/install-platform.sh` followed by `scripts/deploy-local.sh` when
+you need to rebuild the application without deleting the cluster. The deploy
+script is idempotent and also runs the MinIO and local organization bootstrap.
+
+The lower-level image-only flow is:
 
 ```sh
 podman build -t localhost/mariner:local .
@@ -34,13 +58,11 @@ podman save -o /tmp/mariner-local.tar localhost/mariner:local
 kind load image-archive /tmp/mariner-local.tar --name mariner
 ```
 
-Apply supporting services:
-
-```sh
-kubectl apply -k deploy/kustomize/local
-```
-
-The Kustomize overlay provisions a local Keycloak realm named `mariner`, the `mariner` OIDC client, a demo user, PostgreSQL, MinIO, a self-signed CA, and an sslip.io TLS certificate.
+The Kustomize overlay provisions a local Keycloak realm named `mariner`, the
+`mariner` OIDC client, the Keycloak PostgreSQL database, both test users,
+MinIO, a self-signed CA, and an sslip.io TLS certificate. The deploy script
+also creates the Mariner PostgreSQL database and runs the idempotent MinIO
+bootstrap; applying only Kustomize does not create MinIO users or buckets.
 
 Mariner must use the HTTPS issuer and callback:
 
@@ -92,12 +114,22 @@ The chart defaults to PostgreSQL. SQLite is available for lightweight
 single-replica use with `database.driver: sqlite`. PostgreSQL may use `DATABASE_URL` or the chart's
 field-based `database.existingSecret` selectors. Both backends use the same encrypted vault
 envelope schema and the same `audit_events.event_json` JSON content.
+Unlocked HTTP sessions expire after the configured idle timeout, controlled by
+the Helm `sessionIdleTimeout` value (emitted as `SESSION_IDLE_TIMEOUT`, default
+`30m`), with the server enforcing the timeout from shared SQL state.
+The multipart cleanup worker is enabled by default and uses
+`multipartCleanup.interval`/`multipartCleanup.maxAge` (emitted as
+`MULTIPART_CLEANUP_INTERVAL`/`MULTIPART_CLEANUP_MAX_AGE`, defaults `15m`/`12h`).
+It stores an application-encrypted copy of each upload's connection details so
+abandoned S3 multipart uploads can be aborted after the vault is locked.
 
 Audit events are serialized once and stored identically in the selected
-database's `audit_events.event_json` column. The chart enables `audit.sidecar`
-by default; it runs a restricted database-polling sidecar that emits new event
-JSON to stdout for Alloy/Loki. Never include passwords,
+database's `audit_events.event_json` column. The chart enables a single-replica
+`audit-forwarder` Deployment by default; it runs a restricted database-polling
+container that emits new event JSON to stdout for Alloy/Loki. Never include passwords,
 S3 credentials, JWTs, cookies, or object contents in audit events.
+When SQLite is selected, persistence must be enabled so the standalone
+forwarder can mount the same database PVC; the chart co-locates those pods.
 
 ## Validation
 
@@ -110,7 +142,18 @@ curl -ksS https://keycloak.127.0.0.1.sslip.io/realms/mariner/.well-known/openid-
 curl -ksS https://mariner.127.0.0.1.sslip.io/api/me
 ```
 
-The login endpoint should return a redirect to Keycloak. MinIO S3 can be smoke-tested from inside the cluster with the `quay.io/minio/mc` image by creating `mariner`, uploading an object, and running `mc stat`.
+The login endpoint should return a redirect to Keycloak. Verify the shared
+database schema with:
+
+```sh
+kubectl -n mariner exec deploy/mariner-db -- \
+  psql -U mariner -d mariner -c '\\dt'
+```
+
+MinIO S3 can be smoke-tested from inside the cluster with the
+`quay.io/minio/mc` image. The organization connections use
+`http://minio.infra.svc.cluster.local:9000` and buckets
+`org1-bucket-one`, `org1-bucket-two`, and `org1-bucket-three`.
 
 ## Frontend conventions
 

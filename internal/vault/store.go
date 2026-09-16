@@ -11,6 +11,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,6 +82,18 @@ type AuditPage struct {
 }
 type AuditRecord struct {
 	ID, OccurredAt, JSON string
+}
+
+type SessionRecord struct {
+	UserID, UserName, GroupsJSON, PasswordCiphertext string
+	ExpiresAt, LastSeenAt                            time.Time
+}
+
+type MultipartUpload struct {
+	UploadID, UserID, ConnectionID, Bucket, Key, Status string
+	NextPart                                            int32
+	PartsJSON, HashState                                string
+	ConnectionCiphertext                                string
 }
 
 func (s *Store) AuditCursor() (string, string, error) {
@@ -159,12 +172,130 @@ func (s *Store) migrate() error {
 		`CREATE TABLE IF NOT EXISTS audit_events (event_id TEXT PRIMARY KEY, occurred_at TEXT NOT NULL, event_json TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS organizations (id TEXT PRIMARY KEY, encrypted TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS user_preferences (user_id TEXT PRIMARY KEY, settings_json TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, user_name TEXT NOT NULL, groups_json TEXT NOT NULL, password_ciphertext TEXT NOT NULL, expires_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS multipart_uploads (upload_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, connection_id TEXT NOT NULL, bucket TEXT NOT NULL, object_key TEXT NOT NULL, status TEXT NOT NULL, next_part INTEGER NOT NULL, parts_json TEXT NOT NULL, hash_state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 	} {
 		if _, err := s.db.Exec(statement); err != nil {
 			return err
 		}
 	}
+	if _, err := s.db.Exec(s.db.Rebind(`ALTER TABLE multipart_uploads ADD COLUMN connection_ciphertext TEXT NOT NULL DEFAULT ''`)); err != nil {
+		message := strings.ToLower(err.Error())
+		if !strings.Contains(message, "duplicate") && !strings.Contains(message, "already exists") {
+			return err
+		}
+	}
 	return nil
+}
+
+func (s *Store) SaveSession(id, userID, userName, groupsJSON, passwordCiphertext string, expiresAt time.Time) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.Exec(s.db.Rebind(`INSERT INTO sessions(id,user_id,user_name,groups_json,password_ciphertext,expires_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id,user_name=excluded.user_name,groups_json=excluded.groups_json,password_ciphertext=excluded.password_ciphertext,expires_at=excluded.expires_at,updated_at=excluded.updated_at`), id, userID, userName, groupsJSON, passwordCiphertext, expiresAt.UTC().Format(time.RFC3339Nano), now)
+	return err
+}
+
+func (s *Store) LoadSession(id string) (userID, userName, groupsJSON, passwordCiphertext string, expiresAt, lastSeenAt time.Time, found bool, err error) {
+	var record SessionRecord
+	var expires, lastSeen string
+	err = s.db.QueryRowx(s.db.Rebind(`SELECT user_id,user_name,groups_json,password_ciphertext,expires_at,updated_at FROM sessions WHERE id=?`), id).Scan(&record.UserID, &record.UserName, &record.GroupsJSON, &record.PasswordCiphertext, &expires, &lastSeen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", "", "", time.Time{}, time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", "", "", "", time.Time{}, time.Time{}, false, err
+	}
+	record.ExpiresAt, err = time.Parse(time.RFC3339Nano, expires)
+	if err != nil {
+		return "", "", "", "", time.Time{}, time.Time{}, false, err
+	}
+	record.LastSeenAt, err = time.Parse(time.RFC3339Nano, lastSeen)
+	return record.UserID, record.UserName, record.GroupsJSON, record.PasswordCiphertext, record.ExpiresAt, record.LastSeenAt, err == nil, err
+}
+
+func (s *Store) TouchSession(id string, at time.Time) error {
+	_, err := s.db.Exec(s.db.Rebind(`UPDATE sessions SET updated_at=? WHERE id=?`), at.UTC().Format(time.RFC3339Nano), id)
+	return err
+}
+
+func (s *Store) DeleteSession(id string) error {
+	_, err := s.db.Exec(s.db.Rebind(`DELETE FROM sessions WHERE id=?`), id)
+	return err
+}
+
+func (s *Store) CreateMultipartUpload(upload MultipartUpload) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.Exec(s.db.Rebind(`INSERT INTO multipart_uploads(upload_id,user_id,connection_id,bucket,object_key,status,next_part,parts_json,hash_state,created_at,updated_at,connection_ciphertext) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`), upload.UploadID, upload.UserID, upload.ConnectionID, upload.Bucket, upload.Key, "active", 1, "[]", upload.HashState, now, now, upload.ConnectionCiphertext)
+	return err
+}
+
+func (s *Store) LoadMultipartUpload(id string) (MultipartUpload, bool, error) {
+	var upload MultipartUpload
+	err := s.db.QueryRowx(s.db.Rebind(`SELECT upload_id,user_id,connection_id,bucket,object_key,status,next_part,parts_json,hash_state,connection_ciphertext FROM multipart_uploads WHERE upload_id=?`), id).Scan(&upload.UploadID, &upload.UserID, &upload.ConnectionID, &upload.Bucket, &upload.Key, &upload.Status, &upload.NextPart, &upload.PartsJSON, &upload.HashState, &upload.ConnectionCiphertext)
+	if errors.Is(err, sql.ErrNoRows) {
+		return upload, false, nil
+	}
+	return upload, err == nil, err
+}
+
+func (s *Store) ListStaleMultipartUploads(before time.Time) ([]MultipartUpload, error) {
+	rows, err := s.db.Queryx(s.db.Rebind(`SELECT upload_id,user_id,connection_id,bucket,object_key,status,next_part,parts_json,hash_state,connection_ciphertext FROM multipart_uploads WHERE status IN ('active','completing','cleaning') AND updated_at < ? ORDER BY updated_at ASC LIMIT 100`), before.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var uploads []MultipartUpload
+	for rows.Next() {
+		var upload MultipartUpload
+		if err := rows.Scan(&upload.UploadID, &upload.UserID, &upload.ConnectionID, &upload.Bucket, &upload.Key, &upload.Status, &upload.NextPart, &upload.PartsJSON, &upload.HashState, &upload.ConnectionCiphertext); err != nil {
+			return nil, err
+		}
+		uploads = append(uploads, upload)
+	}
+	return uploads, rows.Err()
+}
+
+func (s *Store) ClaimMultipartCleanup(id string, before time.Time) (bool, error) {
+	result, err := s.db.Exec(s.db.Rebind(`UPDATE multipart_uploads SET status='cleaning' WHERE upload_id=? AND status IN ('active','completing','cleaning') AND updated_at < ?`), id, before.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
+}
+
+func (s *Store) SaveMultipartPart(id string, expectedPart int32, partsJSON, hashState string) (bool, error) {
+	result, err := s.db.Exec(s.db.Rebind(`UPDATE multipart_uploads SET next_part=next_part+1,parts_json=?,hash_state=?,updated_at=? WHERE upload_id=? AND status='active' AND next_part=?`), partsJSON, hashState, time.Now().UTC().Format(time.RFC3339Nano), id, expectedPart)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
+}
+
+func (s *Store) ClaimMultipartComplete(id string) (MultipartUpload, bool, error) {
+	result, err := s.db.Exec(s.db.Rebind(`UPDATE multipart_uploads SET status='completing',updated_at=? WHERE upload_id=? AND status='active' AND next_part>1`), time.Now().UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		return MultipartUpload{}, false, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n != 1 {
+		return MultipartUpload{}, false, err
+	}
+	return s.LoadMultipartUpload(id)
+}
+
+func (s *Store) FinishMultipartUpload(id string, success bool) error {
+	status := "active"
+	if success {
+		status = "complete"
+	}
+	_, err := s.db.Exec(s.db.Rebind(`UPDATE multipart_uploads SET status=?,updated_at=? WHERE upload_id=? AND status='completing'`), status, time.Now().UTC().Format(time.RFC3339Nano), id)
+	return err
+}
+
+func (s *Store) DeleteMultipartUpload(id string) error {
+	_, err := s.db.Exec(s.db.Rebind(`DELETE FROM multipart_uploads WHERE upload_id=?`), id)
+	return err
 }
 func (s *Store) GetUserPreferences(userID string) (map[string]bool, error) {
 	var raw string

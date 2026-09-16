@@ -5,6 +5,7 @@ resources:
   - namespace.yaml
   - cert-manager.yaml
   - keycloak-realm.yaml
+  - postgres.yaml
   - keycloak.yaml
   - minio.yaml
   - ingress.yaml

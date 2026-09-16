@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -32,6 +34,12 @@ type Session struct {
 	Password string
 	Expires  time.Time
 }
+type SessionStore interface {
+	SaveSession(id, userID, userName, groupsJSON, passwordCiphertext string, expiresAt time.Time) error
+	LoadSession(id string) (userID, userName, groupsJSON, passwordCiphertext string, expiresAt, lastSeenAt time.Time, found bool, err error)
+	DeleteSession(id string) error
+	TouchSession(id string, at time.Time) error
+}
 type Service struct {
 	Provider                *oidc.Provider
 	OAuth                   *oauth2.Config
@@ -42,9 +50,15 @@ type Service struct {
 	DebugJWT                bool
 	LogoutEnabled           bool
 	LogoutEndpoint          string
-	sessions                map[string]Session
+	SessionIdleTimeout      time.Duration
+	sessionStore            SessionStore
+	sessions                map[string]Session // retained only for tests/standalone use
 	mu                      sync.RWMutex
 }
+
+func (s *Service) SetSessionStore(store SessionStore) { s.sessionStore = store }
+
+func (s *Service) SetSessionIdleTimeout(timeout time.Duration) { s.SessionIdleTimeout = timeout }
 
 func New(issuer, clientID, clientSecret, redirect, cookieSecret, groupsClaim, audienceClaim, audience, nameClaim string, scopes []string, debugJWT, logoutEnabled bool) (*Service, error) {
 	if len(scopes) == 0 {
@@ -173,32 +187,74 @@ func claimGroups(claims map[string]json.RawMessage, key string) []string {
 	}
 	return nil
 }
-func (s *Service) StartSession(w http.ResponseWriter, id string, user User) {
-	s.mu.Lock()
-	s.sessions[id] = Session{User: user, Expires: time.Now().Add(12 * time.Hour)}
-	s.mu.Unlock()
+func (s *Service) StartSession(w http.ResponseWriter, id string, user User) error {
+	expires := time.Now().Add(12 * time.Hour)
+	if s.sessionStore != nil {
+		if err := s.sessionStore.SaveSession(id, user.ID, user.Name, marshalGroups(user.Groups), "", expires); err != nil {
+			return err
+		}
+	} else {
+		s.mu.Lock()
+		s.sessions[id] = Session{User: user, Expires: expires}
+		s.mu.Unlock()
+	}
 	s.setCookie(w, "mariner_session", id, 43200)
+	return nil
 }
 func (s *Service) Current(r *http.Request) (Session, string, bool) {
 	id := s.cookie(r, "mariner_session")
+	if s.sessionStore != nil {
+		userID, userName, groupsJSON, encryptedPassword, expires, lastSeen, found, err := s.sessionStore.LoadSession(id)
+		now := time.Now()
+		if err != nil || !found || now.After(expires) || (s.SessionIdleTimeout > 0 && now.Sub(lastSeen) > s.SessionIdleTimeout) {
+			if found && (now.After(expires) || (s.SessionIdleTimeout > 0 && now.Sub(lastSeen) > s.SessionIdleTimeout)) {
+				_ = s.sessionStore.DeleteSession(id)
+			}
+			return Session{}, id, false
+		}
+		if err := s.sessionStore.TouchSession(id, now); err != nil {
+			return Session{}, id, false
+		}
+		groups := []string{}
+		if json.Unmarshal([]byte(groupsJSON), &groups) != nil {
+			return Session{}, id, false
+		}
+		password, err := decryptSessionSecret(encryptedPassword, s.CookieSecret)
+		if err != nil {
+			return Session{}, id, false
+		}
+		return Session{User: User{ID: userID, Name: userName, Groups: groups}, Password: password, Expires: expires}, id, true
+	}
 	s.mu.RLock()
 	session, ok := s.sessions[id]
 	s.mu.RUnlock()
 	return session, id, ok && time.Now().Before(session.Expires)
 }
-func (s *Service) SetPassword(id, password string) {
+func (s *Service) SetPassword(id, password string) error {
+	if s.sessionStore != nil {
+		session, _, ok := s.CurrentCookie(id)
+		if !ok {
+			return errors.New("session not found")
+		}
+		return s.sessionStore.SaveSession(id, session.User.ID, session.User.Name, marshalGroups(session.User.Groups), encryptSessionSecret(password, s.CookieSecret), session.Expires)
+	}
 	s.mu.Lock()
 	session := s.sessions[id]
 	session.Password = password
 	s.sessions[id] = session
 	s.mu.Unlock()
+	return nil
 }
-func (s *Service) Lock(id string) { s.SetPassword(id, "") }
+func (s *Service) Lock(id string) error { return s.SetPassword(id, "") }
 func (s *Service) Logout(w http.ResponseWriter, r *http.Request) {
 	id := s.cookie(r, "mariner_session")
-	s.mu.Lock()
-	delete(s.sessions, id)
-	s.mu.Unlock()
+	if s.sessionStore != nil {
+		_ = s.sessionStore.DeleteSession(id)
+	} else {
+		s.mu.Lock()
+		delete(s.sessions, id)
+		s.mu.Unlock()
+	}
 	s.setCookie(w, "mariner_session", "", -1)
 	if s.LogoutEnabled && s.LogoutEndpoint != "" {
 		logoutURL, err := url.Parse(s.LogoutEndpoint)
@@ -213,6 +269,75 @@ func (s *Service) Logout(w http.ResponseWriter, r *http.Request) {
 	}
 	http.Redirect(w, r, "/", http.StatusFound)
 }
+
+func (s *Service) CurrentCookie(id string) (Session, string, bool) {
+	if s.sessionStore == nil {
+		s.mu.RLock()
+		session, ok := s.sessions[id]
+		s.mu.RUnlock()
+		return session, id, ok && time.Now().Before(session.Expires)
+	}
+	userID, userName, groupsJSON, encryptedPassword, expires, lastSeen, found, err := s.sessionStore.LoadSession(id)
+	now := time.Now()
+	if err != nil || !found || now.After(expires) || (s.SessionIdleTimeout > 0 && now.Sub(lastSeen) > s.SessionIdleTimeout) {
+		return Session{}, id, false
+	}
+	var groups []string
+	if json.Unmarshal([]byte(groupsJSON), &groups) != nil {
+		return Session{}, id, false
+	}
+	password, err := decryptSessionSecret(encryptedPassword, s.CookieSecret)
+	if err != nil {
+		return Session{}, id, false
+	}
+	return Session{User: User{ID: userID, Name: userName, Groups: groups}, Password: password, Expires: expires}, id, true
+}
+
+func marshalGroups(groups []string) string { raw, _ := json.Marshal(groups); return string(raw) }
+
+func sessionCipher(secret string) (cipher.AEAD, error) {
+	sum := sha256.Sum256([]byte("mariner-session-encryption:" + secret))
+	block, err := aes.NewCipher(sum[:])
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+func encryptSessionSecret(value, secret string) string {
+	if value == "" {
+		return ""
+	}
+	gcm, err := sessionCipher(secret)
+	if err != nil {
+		return ""
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = rand.Read(nonce); err != nil {
+		return ""
+	}
+	return base64.RawStdEncoding.EncodeToString(append(nonce, gcm.Seal(nil, nonce, []byte(value), nil)...))
+}
+func decryptSessionSecret(encoded, secret string) (string, error) {
+	if encoded == "" {
+		return "", nil
+	}
+	payload, err := base64.RawStdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := sessionCipher(secret)
+	if err != nil || len(payload) < gcm.NonceSize() {
+		return "", errors.New("invalid session secret")
+	}
+	raw, err := gcm.Open(nil, payload[:gcm.NonceSize()], payload[gcm.NonceSize():], nil)
+	return string(raw), err
+}
+
+// EncryptForStorage protects short-lived server-side secrets stored in SQL.
+func EncryptForStorage(value, secret string) string { return encryptSessionSecret(value, secret) }
+
+// DecryptForStorage decrypts short-lived server-side secrets stored in SQL.
+func DecryptForStorage(encoded, secret string) (string, error) { return decryptSessionSecret(encoded, secret) }
 func (s *Service) setCookie(w http.ResponseWriter, name, value string, age int) {
 	mac := hmac.New(sha256.New, []byte(s.CookieSecret))
 	mac.Write([]byte(value))

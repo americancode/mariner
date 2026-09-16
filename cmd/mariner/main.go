@@ -44,7 +44,12 @@ func main() {
 		discoveryURL := strings.TrimRight(cfg.OIDCIssuer, "/") + "/.well-known/openid-configuration"
 		log.Fatalf("OIDC initialization failed (issuer=%s, discovery=%s): %v", cfg.OIDCIssuer, discoveryURL, err)
 	}
+	authService.SetSessionStore(store)
+	authService.SetSessionIdleTimeout(cfg.SessionIdleTimeout)
 	server := &httpapi.Server{Auth: authService, Vault: store, Audit: auditLogger, AuditAdminGroup: cfg.AuditAdminGroup, Organizations: cfg.Organizations}
+	if cfg.MultipartCleanupEnabled {
+		server.StartMultipartCleanup(context.Background(), cfg.MultipartCleanupInterval, cfg.MultipartCleanupMaxAge)
+	}
 	log.Printf("mariner listening on %s", cfg.Addr)
 	log.Fatal(http.ListenAndServe(cfg.Addr, server.Router()))
 }

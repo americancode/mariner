@@ -2,11 +2,12 @@ package httpapi
 
 import (
 	"archive/tar"
-	"archive/zip"
+	archivezip "archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -20,13 +21,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/go-chi/chi/v5"
+	encryptedzip "github.com/yeka/zip"
 	"mariner/internal/audit"
 	"mariner/internal/auth"
 	"mariner/internal/config"
@@ -40,19 +41,64 @@ type Server struct {
 	Audit           *audit.Logger
 	AuditAdminGroup string
 	Organizations   map[string]config.Organization
-	uploadMu        sync.Mutex
-	uploads         map[string]*uploadState
 }
 
-type uploadState struct {
-	UserID     string
-	Connection vault.Connection
-	Bucket     string
-	Key        string
-	UploadID   string
-	Hash       hash.Hash
-	Parts      []types.CompletedPart
-	NextPart   int32
+// StartMultipartCleanup runs on every replica; each stale row is atomically
+// claimed in SQL so only one replica cleans a given upload.
+func (s *Server) StartMultipartCleanup(ctx context.Context, interval, maxAge time.Duration) {
+	if interval <= 0 || maxAge <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				s.cleanupMultipartUploads(ctx, now.Add(-maxAge))
+			}
+		}
+	}()
+}
+
+func (s *Server) cleanupMultipartUploads(ctx context.Context, before time.Time) {
+	uploads, err := s.Vault.ListStaleMultipartUploads(before)
+	if err != nil {
+		log.Printf("multipart cleanup list failed: %v", err)
+		return
+	}
+	for _, upload := range uploads {
+		claimed, err := s.Vault.ClaimMultipartCleanup(upload.UploadID, before)
+		if err != nil || !claimed {
+			continue
+		}
+		var connection vault.Connection
+		raw, err := auth.DecryptForStorage(upload.ConnectionCiphertext, s.Auth.CookieSecret)
+		if err == nil {
+			err = json.Unmarshal([]byte(raw), &connection)
+		}
+		if err != nil {
+			log.Printf("multipart cleanup skipped upload=%s: invalid connection data: %v", upload.UploadID, err)
+			continue
+		}
+		client, err := s3client.New(ctx, connection)
+		if err != nil {
+			log.Printf("multipart cleanup client failed upload=%s: %v", upload.UploadID, err)
+			continue
+		}
+		_, err = client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: aws.String(upload.Bucket), Key: aws.String(upload.Key), UploadId: aws.String(upload.UploadID)})
+		if err != nil {
+			log.Printf("multipart cleanup abort failed upload=%s: %v", upload.UploadID, err)
+			continue
+		}
+		if err := s.Vault.DeleteMultipartUpload(upload.UploadID); err != nil {
+			log.Printf("multipart cleanup delete failed upload=%s: %v", upload.UploadID, err)
+			continue
+		}
+		log.Printf("multipart upload cleaned up upload=%s user=%s bucket=%s key=%s", upload.UploadID, upload.UserID, upload.Bucket, upload.Key)
+	}
 }
 
 func (s *Server) audit(session auth.Session, action, result string, fields map[string]string) {
@@ -112,10 +158,12 @@ func (s *Server) Router() http.Handler {
 	r.Delete("/api/file", s.deleteFile)
 	r.Post("/api/upload", s.upload)
 	r.Post("/api/upload/init", s.uploadInit)
+	r.Get("/api/upload/status", s.uploadStatus)
 	r.Put("/api/upload/part", s.uploadPart)
 	r.Post("/api/upload/complete", s.uploadComplete)
 	r.Delete("/api/upload", s.uploadAbort)
 	r.Get("/api/download", s.download)
+	r.Post("/api/download", s.download)
 	// Admin is a client-side route. Serve the SPA entrypoint so direct loads
 	// and browser refreshes do not look for a physical /web/admin file.
 	spa := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -126,6 +174,29 @@ func (s *Server) Router() http.Handler {
 	r.Get("/admin/*", spa)
 	r.Handle("/*", http.FileServer(http.Dir("/web")))
 	return r
+}
+
+func (s *Server) uploadStatus(w http.ResponseWriter, r *http.Request) {
+	session, _, _, err := s.unlocked(r)
+	if err != nil {
+		fail(w, 423, err)
+		return
+	}
+	uploadID := r.URL.Query().Get("uploadId")
+	if uploadID == "" {
+		fail(w, http.StatusBadRequest, errors.New("upload ID is required"))
+		return
+	}
+	upload, ok, err := s.Vault.LoadMultipartUpload(uploadID)
+	if err != nil {
+		fail(w, 500, err)
+		return
+	}
+	if !ok || upload.UserID != session.User.ID {
+		fail(w, http.StatusNotFound, errors.New("multipart upload not found"))
+		return
+	}
+	write(w, map[string]any{"key": upload.Key, "nextPart": upload.NextPart, "status": upload.Status})
 }
 func (s *Server) login(w http.ResponseWriter, r *http.Request) { s.Auth.Login(w, r) }
 
@@ -332,7 +403,10 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
-	s.Auth.StartSession(w, id, user)
+	if err := s.Auth.StartSession(w, id, user); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	s.audit(auth.Session{User: user}, "auth.login", "success", nil)
 	http.Redirect(w, r, "/", http.StatusFound)
 }
@@ -379,7 +453,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, err)
 		return
 	}
-	write(w, map[string]bool{"exists": exists})
+	write(w, map[string]bool{"exists": exists, "unlocked": session.Password != ""})
 }
 func (s *Server) unlock(w http.ResponseWriter, r *http.Request) {
 	session, id, err := s.session(r)
@@ -966,12 +1040,13 @@ func (s *Server) uploadInit(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadGateway, errors.New("S3 returned an empty multipart upload ID"))
 		return
 	}
-	s.uploadMu.Lock()
-	if s.uploads == nil {
-		s.uploads = make(map[string]*uploadState)
+	hashState, _ := marshalHash(sha256.New())
+	connectionJSON, _ := json.Marshal(c)
+	if err := s.Vault.CreateMultipartUpload(vault.MultipartUpload{UploadID: aws.ToString(created.UploadId), UserID: session.User.ID, ConnectionID: c.ID, Bucket: c.Bucket, Key: key, HashState: hashState, ConnectionCiphertext: auth.EncryptForStorage(string(connectionJSON), s.Auth.CookieSecret)}); err != nil {
+		_, _ = client.AbortMultipartUpload(r.Context(), &s3.AbortMultipartUploadInput{Bucket: aws.String(c.Bucket), Key: aws.String(key), UploadId: created.UploadId})
+		fail(w, http.StatusInternalServerError, err)
+		return
 	}
-	s.uploads[aws.ToString(created.UploadId)] = &uploadState{UserID: session.User.ID, Connection: c, Bucket: c.Bucket, Key: key, UploadID: aws.ToString(created.UploadId), Hash: sha256.New(), NextPart: 1}
-	s.uploadMu.Unlock()
 	write(w, map[string]string{"uploadId": aws.ToString(created.UploadId), "key": key})
 }
 
@@ -987,14 +1062,16 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, errors.New("upload ID and part number are required"))
 		return
 	}
-	s.uploadMu.Lock()
-	state, ok := s.uploads[uploadID]
-	s.uploadMu.Unlock()
-	if !ok || state.UserID != session.User.ID {
+	record, ok, err := s.Vault.LoadMultipartUpload(uploadID)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !ok || record.UserID != session.User.ID || record.Status != "active" {
 		fail(w, http.StatusNotFound, errors.New("multipart upload not found"))
 		return
 	}
-	if int32(partNumber) != state.NextPart {
+	if int32(partNumber) != record.NextPart {
 		fail(w, http.StatusBadRequest, errors.New("multipart parts must be uploaded in order"))
 		return
 	}
@@ -1017,16 +1094,38 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err)
 		return
 	}
-	part, err := client.UploadPart(r.Context(), &s3.UploadPartInput{Bucket: aws.String(state.Bucket), Key: aws.String(state.Key), UploadId: aws.String(uploadID), PartNumber: aws.Int32(int32(partNumber)), Body: bytes.NewReader(body), ContentLength: aws.Int64(int64(len(body)))})
+	part, err := client.UploadPart(r.Context(), &s3.UploadPartInput{Bucket: aws.String(record.Bucket), Key: aws.String(record.Key), UploadId: aws.String(uploadID), PartNumber: aws.Int32(int32(partNumber)), Body: bytes.NewReader(body), ContentLength: aws.Int64(int64(len(body)))})
 	if err != nil {
 		fail(w, http.StatusBadGateway, err)
 		return
 	}
-	s.uploadMu.Lock()
-	state.Hash.Write(body)
-	state.Parts = append(state.Parts, types.CompletedPart{ETag: part.ETag, PartNumber: aws.Int32(int32(partNumber))})
-	state.NextPart++
-	s.uploadMu.Unlock()
+	parts := []types.CompletedPart{}
+	if err := json.Unmarshal([]byte(record.PartsJSON), &parts); err != nil {
+		fail(w, 500, err)
+		return
+	}
+	parts = append(parts, types.CompletedPart{ETag: part.ETag, PartNumber: aws.Int32(int32(partNumber))})
+	hasher, err := unmarshalHash(record.HashState)
+	if err != nil {
+		fail(w, 500, err)
+		return
+	}
+	_, _ = hasher.Write(body)
+	hashState, err := marshalHash(hasher)
+	if err != nil {
+		fail(w, 500, err)
+		return
+	}
+	partsJSON, _ := json.Marshal(parts)
+	updated, err := s.Vault.SaveMultipartPart(uploadID, int32(partNumber), string(partsJSON), hashState)
+	if err != nil {
+		fail(w, 500, err)
+		return
+	}
+	if !updated {
+		fail(w, http.StatusConflict, errors.New("multipart part was already advanced; retry the upload"))
+		return
+	}
 	write(w, map[string]any{"partNumber": partNumber, "etag": aws.ToString(part.ETag)})
 }
 
@@ -1041,17 +1140,77 @@ func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, errors.New("upload ID is required"))
 		return
 	}
-	s.uploadMu.Lock()
-	state, ok := s.uploads[uploadID]
-	if ok {
-		delete(s.uploads, uploadID)
+	current, ok, err := s.Vault.LoadMultipartUpload(uploadID)
+	if err != nil {
+		fail(w, 500, err)
+		return
 	}
-	s.uploadMu.Unlock()
-	if !ok || state.UserID != session.User.ID || len(state.Parts) == 0 {
+	if !ok || current.UserID != session.User.ID {
+		fail(w, http.StatusNotFound, errors.New("multipart upload not found or empty"))
+		return
+	}
+	state, ok, err := s.Vault.ClaimMultipartComplete(uploadID)
+	if err != nil {
+		fail(w, 500, err)
+		return
+	}
+	if !ok || state.UserID != session.User.ID {
 		fail(w, http.StatusNotFound, errors.New("multipart upload not found or empty"))
 		return
 	}
 	c, err := s.connectionValue(r.URL.Query().Get("connection"), data, session.User)
+	if err != nil {
+		_ = s.Vault.FinishMultipartUpload(uploadID, false)
+		fail(w, http.StatusNotFound, err)
+		return
+	}
+	client, err := s3client.New(r.Context(), c)
+	if err != nil {
+		_ = s.Vault.FinishMultipartUpload(uploadID, false)
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	var parts []types.CompletedPart
+	if err = json.Unmarshal([]byte(state.PartsJSON), &parts); err != nil {
+		_ = s.Vault.FinishMultipartUpload(uploadID, false)
+		fail(w, 500, err)
+		return
+	}
+	_, err = client.CompleteMultipartUpload(r.Context(), &s3.CompleteMultipartUploadInput{Bucket: aws.String(state.Bucket), Key: aws.String(state.Key), UploadId: aws.String(uploadID), MultipartUpload: &types.CompletedMultipartUpload{Parts: parts}})
+	if err != nil {
+		_, _ = client.AbortMultipartUpload(r.Context(), &s3.AbortMultipartUploadInput{Bucket: aws.String(state.Bucket), Key: aws.String(state.Key), UploadId: aws.String(uploadID)})
+		_ = s.Vault.FinishMultipartUpload(uploadID, false)
+		fail(w, http.StatusBadGateway, err)
+		return
+	}
+	_ = s.Vault.FinishMultipartUpload(uploadID, true)
+	hasher, err := unmarshalHash(state.HashState)
+	if err != nil {
+		fail(w, 500, err)
+		return
+	}
+	digest := hex.EncodeToString(hasher.Sum(nil))
+	s.audit(session, "object.upload", "success", map[string]string{"connection_id": c.ID, "bucket": c.Bucket, "object_key": state.Key, "file_sha256": digest})
+	write(w, map[string]bool{"ok": true})
+}
+
+func (s *Server) uploadAbort(w http.ResponseWriter, r *http.Request) {
+	session, _, data, err := s.unlocked(r)
+	if err != nil {
+		fail(w, 423, err)
+		return
+	}
+	uploadID := r.URL.Query().Get("uploadId")
+	state, ok, err := s.Vault.LoadMultipartUpload(uploadID)
+	if err != nil {
+		fail(w, 500, err)
+		return
+	}
+	if !ok || state.UserID != session.User.ID {
+		write(w, map[string]bool{"ok": true})
+		return
+	}
+	c, err := s.connectionValue(state.ConnectionID, data, session.User)
 	if err != nil {
 		fail(w, http.StatusNotFound, err)
 		return
@@ -1061,39 +1220,40 @@ func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err)
 		return
 	}
-	_, err = client.CompleteMultipartUpload(r.Context(), &s3.CompleteMultipartUploadInput{Bucket: aws.String(state.Bucket), Key: aws.String(state.Key), UploadId: aws.String(uploadID), MultipartUpload: &types.CompletedMultipartUpload{Parts: state.Parts}})
-	if err != nil {
-		_, _ = client.AbortMultipartUpload(r.Context(), &s3.AbortMultipartUploadInput{Bucket: aws.String(state.Bucket), Key: aws.String(state.Key), UploadId: aws.String(uploadID)})
+	if _, err = client.AbortMultipartUpload(r.Context(), &s3.AbortMultipartUploadInput{Bucket: aws.String(state.Bucket), Key: aws.String(state.Key), UploadId: aws.String(uploadID)}); err != nil {
 		fail(w, http.StatusBadGateway, err)
 		return
 	}
-	digest := hex.EncodeToString(state.Hash.Sum(nil))
-	s.audit(session, "object.upload", "success", map[string]string{"connection_id": c.ID, "bucket": c.Bucket, "object_key": state.Key, "file_sha256": digest})
+	if err = s.Vault.DeleteMultipartUpload(uploadID); err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
 	write(w, map[string]bool{"ok": true})
 }
 
-func (s *Server) uploadAbort(w http.ResponseWriter, r *http.Request) {
-	session, _, _, err := s.unlocked(r)
+func marshalHash(h hash.Hash) (string, error) {
+	value, ok := h.(encoding.BinaryMarshaler)
+	if !ok {
+		return "", errors.New("hash state is not serializable")
+	}
+	data, err := value.MarshalBinary()
+	return base64.RawStdEncoding.EncodeToString(data), err
+}
+
+func unmarshalHash(encoded string) (hash.Hash, error) {
+	data, err := base64.RawStdEncoding.DecodeString(encoded)
 	if err != nil {
-		fail(w, 423, err)
-		return
+		return nil, err
 	}
-	uploadID := r.URL.Query().Get("uploadId")
-	s.uploadMu.Lock()
-	state, ok := s.uploads[uploadID]
-	if ok {
-		delete(s.uploads, uploadID)
+	h := sha256.New()
+	value, ok := h.(encoding.BinaryUnmarshaler)
+	if !ok {
+		return nil, errors.New("hash state is not restorable")
 	}
-	s.uploadMu.Unlock()
-	if !ok || state.UserID != session.User.ID {
-		write(w, map[string]bool{"ok": true})
-		return
+	if err = value.UnmarshalBinary(data); err != nil {
+		return nil, err
 	}
-	client, err := s3client.New(r.Context(), state.Connection)
-	if err == nil {
-		_, _ = client.AbortMultipartUpload(r.Context(), &s3.AbortMultipartUploadInput{Bucket: aws.String(state.Bucket), Key: aws.String(state.Key), UploadId: aws.String(uploadID)})
-	}
-	write(w, map[string]bool{"ok": true})
+	return h, nil
 }
 
 const multipartPartSize int64 = 64 * 1024 * 1024
@@ -1149,14 +1309,34 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		fail(w, 423, err)
 		return
 	}
-	c, err := s.connection(r, data, session.User)
-	if err != nil {
-		fail(w, 404, err)
-		return
+	var connectionID, prefix, format, password string
+	if r.Method == http.MethodPost {
+		var request struct {
+			Connection, Prefix, Format, Password string
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			fail(w, http.StatusBadRequest, errors.New("invalid download request"))
+			return
+		}
+		connectionID, prefix, format, password = request.Connection, request.Prefix, request.Format, request.Password
+	} else {
+		connectionID, prefix, format = r.URL.Query().Get("connection"), r.URL.Query().Get("prefix"), r.URL.Query().Get("format")
 	}
-	prefix, format := r.URL.Query().Get("prefix"), r.URL.Query().Get("format")
 	if format != "zip" && format != "tgz" {
 		fail(w, 400, errors.New("format must be zip or tgz"))
+		return
+	}
+	if password != "" && format != "zip" {
+		fail(w, http.StatusBadRequest, errors.New("password protection is supported for ZIP only"))
+		return
+	}
+	if password != "" && len(password) < 10 {
+		fail(w, http.StatusBadRequest, errors.New("ZIP password must be at least 10 characters"))
+		return
+	}
+	c, err := s.connectionValue(connectionID, data, session.User)
+	if err != nil {
+		fail(w, 404, err)
 		return
 	}
 	client, err := s3client.New(r.Context(), c)
@@ -1174,12 +1354,18 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name+ext))
-	var zw *zip.Writer
+	var zw *archivezip.Writer
+	var ezw *encryptedzip.Writer
 	var tw *tar.Writer
 	var gz *gzip.Writer
 	if format == "zip" {
-		zw = zip.NewWriter(w)
-		defer zw.Close()
+		if password != "" {
+			ezw = encryptedzip.NewWriter(w)
+			defer ezw.Close()
+		} else {
+			zw = archivezip.NewWriter(w)
+			defer zw.Close()
+		}
 	} else {
 		gz = gzip.NewWriter(w)
 		defer gz.Close()
@@ -1203,7 +1389,12 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if format == "zip" {
-				entry, e := zw.Create(rel)
+				var entry io.Writer
+				if password != "" {
+					entry, e = ezw.Encrypt(rel, password, encryptedzip.AES256Encryption)
+				} else {
+					entry, e = zw.Create(rel)
+				}
 				if e == nil {
 					_, e = io.Copy(entry, body.Body)
 				}

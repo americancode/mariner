@@ -9,7 +9,7 @@ import (
 )
 
 // RunForwarder emits new database audit JSON events to stdout. The cursor is
-// initialized to the latest row so a sidecar restart does not replay history.
+// initialized to the latest row so a forwarder restart does not replay history.
 func RunForwarder(ctx context.Context, store *vault.Store, interval time.Duration, batchSize int) error {
 	if interval <= 0 {
 		interval = 2 * time.Second

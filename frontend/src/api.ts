@@ -83,7 +83,7 @@ export const api = {
   createOrganization: (organization: Organization) => request<Organization>("/api/admin/organizations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(organization) }),
   updateOrganization: (organization: Organization) => request<Organization>("/api/admin/organizations", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(organization) }),
   deleteOrganization: (id: string) => request<void>(`/api/admin/organizations?id=${encodeURIComponent(id)}`, { method: "DELETE" }),
-  status: () => request<{ exists: boolean }>("/api/vault/status"),
+  status: () => request<{ exists: boolean; unlocked: boolean }>("/api/vault/status"),
   unlock: async (password: string) => {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 60_000);
@@ -159,45 +159,88 @@ export const api = {
     request<void>(`/api/file?connection=${id}&key=${encodeURIComponent(key)}`, {
       method: "DELETE",
     }),
-  download: (id: string, prefix: string, format: "zip" | "tgz") =>
-    fetch(
-      `/api/download?connection=${id}&prefix=${encodeURIComponent(prefix)}&format=${format}`,
-    ).then(async (response) => {
-      if (!response.ok) throw new Error(await response.text());
-      return response.blob();
+  download: async (id: string, prefix: string, format: "zip" | "tgz", password?: string) => {
+    const response = await fetch(
+      password
+        ? "/api/download"
+        : `/api/download?connection=${id}&prefix=${encodeURIComponent(prefix)}&format=${format}`,
+      password
+        ? {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ connection: id, prefix, format, password }),
+          }
+        : undefined,
+    );
+    if (!response.ok) throw new Error(await response.text());
+    return response.blob();
+  },
+  uploadStatus: (uploadId: string) =>
+    request<{ key: string; nextPart: number; status: string }>(
+      `/api/upload/status?uploadId=${encodeURIComponent(uploadId)}`,
+    ),
+  abortUpload: (uploadId: string) =>
+    request<void>(`/api/upload?uploadId=${encodeURIComponent(uploadId)}`, {
+      method: "DELETE",
     }),
   upload: (
     id: string,
     prefix: string,
     file: File,
     onProgress?: (value: number) => void,
+    onUploadId?: (uploadId: string, key: string) => void,
+    resume?: { uploadId: string; key: string },
+    signal?: AbortSignal,
   ) =>
     (async () => {
-      const { uploadId, key } = await request<{ uploadId: string; key: string }>(
-        "/api/upload/init",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            connection: id,
-            prefix,
-            name: file.name,
-            size: file.size,
-            contentType: file.type,
-          }),
-        },
-      );
+      const throwIfAborted = () => {
+        if (signal?.aborted) throw new DOMException("Upload cancelled", "AbortError");
+      };
+      let uploadId = resume?.uploadId;
+      let key = resume?.key;
+      if (uploadId) {
+        throwIfAborted();
+        const status = await api.uploadStatus(uploadId);
+        if (status.status !== "active") throw new Error("This upload is no longer resumable");
+        key = status.key;
+      } else {
+        const initialized = await request<{ uploadId: string; key: string }>(
+          "/api/upload/init",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              connection: id,
+              prefix,
+              name: file.name,
+              size: file.size,
+              contentType: file.type,
+            }),
+            signal,
+          },
+        );
+        uploadId = initialized.uploadId;
+        key = initialized.key;
+      }
+      if (!uploadId || !key) throw new Error("Upload initialization failed");
+      onUploadId?.(uploadId, key);
       const partSize = 16 * 1024 * 1024;
       try {
-        let partNumber = 1;
-        for (let offset = 0; offset < file.size || (file.size === 0 && partNumber === 1); offset += partSize) {
+        let partNumber = resume
+          ? (await api.uploadStatus(uploadId)).nextPart
+          : 1;
+        let offset = (partNumber - 1) * partSize;
+        for (; offset < file.size || (file.size === 0 && partNumber === 1); offset += partSize) {
+          throwIfAborted();
           const chunk = file.slice(offset, Math.min(offset + partSize, file.size));
           await new Promise<void>((resolve, reject) => {
             const xhr = new XMLHttpRequest();
+            const abort = () => xhr.abort();
             xhr.open(
               "PUT",
               `/api/upload/part?connection=${encodeURIComponent(id)}&uploadId=${encodeURIComponent(uploadId)}&partNumber=${partNumber}`,
             );
+            signal?.addEventListener("abort", abort, { once: true });
             xhr.upload.onprogress = (event) => {
               if (event.lengthComputable) {
                 const uploaded = offset + event.loaded;
@@ -205,17 +248,25 @@ export const api = {
               }
             };
             xhr.onload = () => {
+              signal?.removeEventListener("abort", abort);
               if (xhr.status >= 200 && xhr.status < 300) resolve();
               else reject(new Error(xhr.responseText || "Upload part failed"));
             };
-            xhr.onerror = () => reject(new Error("Upload part failed"));
+            xhr.onerror = () => {
+              signal?.removeEventListener("abort", abort);
+              reject(signal?.aborted ? new DOMException("Upload cancelled", "AbortError") : new Error("Upload part failed"));
+            };
+            xhr.onabort = () => {
+              signal?.removeEventListener("abort", abort);
+              reject(new DOMException("Upload cancelled", "AbortError"));
+            };
             xhr.send(chunk);
           });
           partNumber += 1;
         }
         await request<void>(
           `/api/upload/complete?connection=${encodeURIComponent(id)}&uploadId=${encodeURIComponent(uploadId)}&key=${encodeURIComponent(key)}`,
-          { method: "POST" },
+          { method: "POST", signal },
         );
         onProgress?.(100);
       } catch (error) {

@@ -11,5 +11,5 @@ The SQLite vault is persisted in the {{ include "mariner.fullname" . }} PVC.
 {{- else }}
 Mariner uses PostgreSQL through the configured database URL or Secret.
 {{- end }}
-The audit sidecar polls the database and forwards new canonical JSON events to
-stdout when enabled; no shared audit-log volume is required.
+The standalone audit-forwarder polls the database and forwards new canonical
+JSON events to stdout when enabled; no shared audit-log volume is required.
