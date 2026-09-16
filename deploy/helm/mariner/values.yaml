@@ -148,11 +148,12 @@ caBundle:
 cookieSecret: ""
 audit:
   # Enables database audit event recording in Mariner. The forwarder is only
-  # created when this is true and audit.forwarder.enabled is also true.
+  # enabled when this is true and audit.forwarder.enabled is also true.
   enabled: true
   forwarder:
-    # Enables one standalone audit-forwarder pod, independent of the Mariner
-    # application replica count. Set false when another collector reads SQL.
+    # Enables audit forwarding. PostgreSQL uses one standalone forwarder pod;
+    # SQLite runs the same forwarder as a Mariner sidecar so its RWO PVC stays
+    # on one pod/node. Set false when another collector reads SQL.
     enabled: true
     pollingInterval: 2s
     batchSize: 100

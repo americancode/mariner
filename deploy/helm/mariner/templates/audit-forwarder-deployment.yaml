@@ -1,7 +1,4 @@
-{{- if and .Values.audit.enabled .Values.audit.forwarder.enabled }}
-{{- if and (eq .Values.database.driver "sqlite") (not .Values.persistence.enabled) }}
-{{- fail "persistence.enabled must be true when database.driver is sqlite and the audit forwarder is enabled" }}
-{{- end }}
+{{- if and .Values.audit.enabled .Values.audit.forwarder.enabled (ne .Values.database.driver "sqlite") }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,16 +22,6 @@ spec:
       serviceAccountName: {{ include "mariner.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- if eq .Values.database.driver "sqlite" }}
-      affinity:
-        podAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels:
-                  app.kubernetes.io/name: {{ include "mariner.name" . }}
-                  app.kubernetes.io/instance: {{ .Release.Name }}
-              topologyKey: kubernetes.io/hostname
-      {{- end }}
       containers:
         - name: audit-forwarder
           image: {{ default (printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag)) .Values.audit.forwarder.image | quote }}

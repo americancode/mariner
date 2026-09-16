@@ -44,9 +44,9 @@ database:
 
 Alternatively, set `existingSecret.urlKey` to use one Secret field containing a complete PostgreSQL URL.
 
-Every audit event is serialized once as canonical JSON and stored byte-for-byte in the selected database's `audit_events.event_json` column. The optional single-replica audit-forwarder Deployment polls that table and writes each new `event_json` value unchanged to stdout for Alloy/Loki. This keeps SQLite and PostgreSQL audit content identical without requiring a shared audit-log file or PVC.
+Every audit event is serialized once as canonical JSON and stored byte-for-byte in the selected database's `audit_events.event_json` column. With PostgreSQL, the optional single-replica audit-forwarder Deployment polls that table and writes each new `event_json` value unchanged to stdout for Alloy/Loki. With SQLite, the same forwarder runs as a Mariner sidecar so the RWO application PVC remains local to one pod and node. This keeps SQLite and PostgreSQL audit content identical without requiring a shared audit-log file or RWX volume.
 
-The chart's standalone audit-forwarder Deployment polls the configured database and forwards new audit rows to stdout for Alloy/Loki:
+The chart's audit forwarder polls the configured database and forwards new audit rows to stdout for Alloy/Loki. PostgreSQL provisions it as a standalone Deployment; SQLite provisions it as a Mariner sidecar:
 
 ```yaml
 audit:
@@ -56,8 +56,8 @@ audit:
     image: ""
 ```
 
-The forwarder is enabled by default and always runs as one replica, independent
-of the Mariner application replica count. It starts at the latest audit
+The forwarder is enabled by default. It runs as one standalone replica with
+PostgreSQL and as one sidecar per Mariner pod with SQLite. It starts at the latest audit
 row and emits only newly committed rows, so a restart does not replay history.
 Set `audit.forwarder.enabled: false` when another collector reads the database.
 The forwarder is vendor-neutral and supports custom `image`, `command`, `args`,
@@ -152,7 +152,7 @@ An empty object or an empty `name` makes the chart create its release Secret and
 
 Stale multipart uploads are cleaned up by the Mariner background worker. Configure `multipartCleanup.enabled`, `multipartCleanup.interval` (default `15m`), and `multipartCleanup.maxAge` (default `12h`). The worker aborts the S3 upload before deleting its SQL metadata; failed cleanup remains eligible for a later retry.
 
-When using SQLite with the standalone audit-forwarder, set `persistence.enabled: true`; the forwarder mounts the same PVC as Mariner and is scheduled on the same node. PostgreSQL does not require the application PVC.
+When using SQLite, set `persistence.enabled: true`; the sidecar mounts the same PVC as Mariner and remains in the same pod. SQLite also forces the Mariner Deployment to use the `Recreate` strategy during upgrades, preventing overlapping application pods. PostgreSQL uses `RollingUpdate` and does not require the application PVC.
 
 OIDC logout is enabled by default. Mariner clears its local session and then redirects through the provider's discovered `end_session_endpoint`; set `oidc.logout.enabled: false` to perform local-only logout.
 

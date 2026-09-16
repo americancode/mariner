@@ -124,12 +124,13 @@ It stores an application-encrypted copy of each upload's connection details so
 abandoned S3 multipart uploads can be aborted after the vault is locked.
 
 Audit events are serialized once and stored identically in the selected
-database's `audit_events.event_json` column. The chart enables a single-replica
-`audit-forwarder` Deployment by default; it runs a restricted database-polling
-container that emits new event JSON to stdout for Alloy/Loki. Never include passwords,
+database's `audit_events.event_json` column. The chart enables audit forwarding
+by default. PostgreSQL runs a restricted standalone single-replica
+database-polling forwarder; SQLite runs the same forwarder as a restricted
+sidecar in the Mariner pod so the RWO PVC remains local. Never include passwords,
 S3 credentials, JWTs, cookies, or object contents in audit events.
-When SQLite is selected, persistence must be enabled so the standalone
-forwarder can mount the same database PVC; the chart co-locates those pods.
+When SQLite is selected, persistence must be enabled so the sidecar can mount
+the application database PVC.
 
 ## Validation
 
@@ -190,7 +191,9 @@ interactive states.
 ## Safety and production caveats
 
 - Do not use the local credentials or self-signed CA outside development.
-- SQLite uses a single replica and a ReadWriteOnce PVC; do not scale Mariner horizontally without changing storage/session design.
+- SQLite uses a single replica and a ReadWriteOnce PVC; the chart uses
+  `Recreate` upgrades and runs the audit forwarder as a Mariner sidecar. Do not
+  scale Mariner horizontally without changing storage/session design.
 - The local PostgreSQL and MinIO manifests use ephemeral storage.
 - Avoid deleting the Mariner PVC during troubleshooting; it contains the encrypted vault.
 - Do not use `kubectl port-forward` as a substitute for the configured host 80/443 mappings unless diagnosing ingress.

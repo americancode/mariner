@@ -7,6 +7,15 @@ metadata:
     {{- include "mariner.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- if eq .Values.database.driver "sqlite" }}
+  # SQLite must not overlap application pods while the shared database file
+  # is being replaced or migrated during a Helm upgrade.
+  strategy:
+    type: Recreate
+  {{- else }}
+  strategy:
+    type: RollingUpdate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "mariner.selectorLabels" . | nindent 6 }}
@@ -171,6 +180,52 @@ spec:
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+        {{- if and .Values.audit.enabled .Values.audit.forwarder.enabled (eq .Values.database.driver "sqlite") }}
+        # SQLite keeps the forwarder in this pod so the RWO application PVC
+        # is never required to attach to a second node.
+        - name: audit-forwarder
+          image: {{ default (printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag)) .Values.audit.forwarder.image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.audit.forwarder.command }}
+          command:
+            {{- toYaml .Values.audit.forwarder.command | nindent 12 }}
+          {{- else }}
+          command: ["/mariner", "audit-forwarder"]
+          {{- end }}
+          {{- if .Values.audit.forwarder.args }}
+          args:
+            {{- toYaml .Values.audit.forwarder.args | nindent 12 }}
+          {{- end }}
+          env:
+            - name: DATABASE_DRIVER
+              value: sqlite
+            - name: DATA_DIR
+              value: /data
+            - name: AUDIT_FORWARDER_POLLING_INTERVAL
+              value: {{ default "2s" .Values.audit.forwarder.pollingInterval | quote }}
+            - name: AUDIT_FORWARDER_BATCH_SIZE
+              value: {{ default 100 .Values.audit.forwarder.batchSize | quote }}
+            {{- with .Values.audit.forwarder.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.audit.forwarder.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.audit.forwarder.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- end }}
       volumes:
         - name: data
           {{- if .Values.persistence.enabled }}

@@ -11,5 +11,6 @@ The SQLite vault is persisted in the {{ include "mariner.fullname" . }} PVC.
 {{- else }}
 Mariner uses PostgreSQL through the configured database URL or Secret.
 {{- end }}
-The standalone audit-forwarder polls the database and forwards new canonical
-JSON events to stdout when enabled; no shared audit-log volume is required.
+When audit forwarding is enabled, PostgreSQL uses a standalone single-replica
+audit-forwarder Deployment. SQLite runs the forwarder as a Mariner sidecar so
+the RWO application PVC remains on one pod and node.
