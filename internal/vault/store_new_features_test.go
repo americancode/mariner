@@ -34,6 +34,47 @@ func TestSQLSessionRoundTripAndDelete(t *testing.T) {
 	}
 }
 
+func TestSQLSessionTouchOnlyUpdatesStaleSession(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	expires := time.Now().UTC().Add(time.Hour)
+	if err := store.SaveSession("session-1", "user-1", "Demo", `[]`, "", expires); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, _, initial, found, err := store.LoadSession("session-1")
+	if err != nil || !found {
+		t.Fatalf("load session: found=%v err=%v", found, err)
+	}
+
+	recent := initial.Add(10 * time.Second)
+	if err := store.TouchSessionIfStale("session-1", recent, initial); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, _, unchanged, _, err := store.LoadSession("session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unchanged.Equal(initial) {
+		t.Fatalf("recent session was updated: got %s want %s", unchanged, initial)
+	}
+
+	stale := initial.Add(time.Minute)
+	if err := store.TouchSessionIfStale("session-1", stale, initial.Add(30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, _, updated, _, err := store.LoadSession("session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.Equal(stale) {
+		t.Fatalf("stale session was not updated: got %s want %s", updated, stale)
+	}
+}
+
 func TestSQLMultipartStateAdvancesAndClaimsOnce(t *testing.T) {
 	store, err := Open(t.TempDir())
 	if err != nil {

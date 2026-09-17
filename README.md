@@ -60,40 +60,28 @@ The forwarder is enabled by default. It runs as one standalone replica with
 PostgreSQL and as one sidecar per Mariner pod with SQLite. It starts at the latest audit
 row and emits only newly committed rows, so a restart does not replay history.
 Set `audit.forwarder.enabled: false` when another collector reads the database.
-The forwarder is vendor-neutral and supports custom `image`, `command`, `args`,
-`env`, and `envFrom` values. This allows a custom Splunk HEC shipper image to
-poll or forward events directly:
+The forwarder supports custom `image`, `command`, `args`, `env`, and `envFrom`
+values for integrations with an external log collector:
 
 ```yaml
 audit:
   forwarder:
-    image: registry.example.com/audit-to-splunk:1.0.0
-    command: ["/bin/audit-to-splunk"]
+    image: registry.example.com/audit-forwarder:1.0.0
+    command: ["/bin/audit-forwarder"]
     args: ["--database"]
-    env:
-      - name: SPLUNK_HEC_URL
-        valueFrom:
-          secretKeyRef:
-            name: splunk-hec
-            key: url
-    envFrom:
-      - secretRef:
-          name: splunk-hec
 ```
-
-Keep HEC URLs and tokens in Secret references; do not put them in Helm values.
 
 The chart also supports standard pod volume hooks for custom forwarder or
 application configuration:
 
 ```yaml
 extraVolumes:
-  - name: splunk-ca
+  - name: audit-ca
     secret:
-      secretName: splunk-ca
+      secretName: audit-ca
 extraVolumeMounts:
-  - name: splunk-ca
-    mountPath: /etc/splunk-ca
+  - name: audit-ca
+    mountPath: /etc/audit-ca
     readOnly: true
 ```
 

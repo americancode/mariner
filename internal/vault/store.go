@@ -212,8 +212,8 @@ func (s *Store) LoadSession(id string) (userID, userName, groupsJSON, passwordCi
 	return record.UserID, record.UserName, record.GroupsJSON, record.PasswordCiphertext, record.ExpiresAt, record.LastSeenAt, err == nil, err
 }
 
-func (s *Store) TouchSession(id string, at time.Time) error {
-	_, err := s.db.Exec(s.db.Rebind(`UPDATE sessions SET updated_at=? WHERE id=?`), at.UTC().Format(time.RFC3339Nano), id)
+func (s *Store) TouchSessionIfStale(id string, at, before time.Time) error {
+	_, err := s.db.Exec(s.db.Rebind(`UPDATE sessions SET updated_at=? WHERE id=? AND updated_at < ?`), at.UTC().Format(time.RFC3339Nano), id, before.UTC().Format(time.RFC3339Nano))
 	return err
 }
 

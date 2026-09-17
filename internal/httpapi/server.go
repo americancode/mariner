@@ -43,6 +43,8 @@ type Server struct {
 	Organizations   map[string]config.Organization
 }
 
+var errAdminRequired = errors.New("administrator access required")
+
 // StartMultipartCleanup runs on every replica; each stale row is atomically
 // claimed in SQL so only one replica cleans a given upload.
 func (s *Server) StartMultipartCleanup(ctx context.Context, interval, maxAge time.Duration) {
@@ -203,10 +205,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) { s.Auth.Login(w,
 func (s *Server) adminAudit(w http.ResponseWriter, r *http.Request) {
 	session, _, err := s.session(r)
 	if err != nil {
+		log.Printf("admin audit authorization failed error=%v", err)
 		fail(w, http.StatusUnauthorized, err)
 		return
 	}
 	if s.AuditAdminGroup == "" || !hasGroup(session.User.Groups, []string{s.AuditAdminGroup}) {
+		log.Printf("admin audit authorization denied required_group=%q", s.AuditAdminGroup)
 		fail(w, http.StatusForbidden, errors.New("audit administrator access required"))
 		return
 	}
@@ -223,6 +227,7 @@ func (s *Server) adminAudit(w http.ResponseWriter, r *http.Request) {
 		Offset: offset,
 	})
 	if err != nil {
+		log.Printf("admin audit database query failed error=%v", err)
 		fail(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -230,34 +235,48 @@ func (s *Server) adminAudit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) adminAuditActions(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.adminAllowed(r); !ok {
-		fail(w, http.StatusForbidden, errors.New("administrator access required"))
+	if _, ok, err := s.adminAllowed(r); !ok {
+		status := http.StatusForbidden
+		if err != nil && !errors.Is(err, errAdminRequired) {
+			status = http.StatusUnauthorized
+		}
+		fail(w, status, authorizationError(err, errAdminRequired))
 		return
 	}
 	actions, err := s.Vault.ListAuditActions()
 	if err != nil {
+		log.Printf("admin audit actions database query failed error=%v", err)
 		fail(w, http.StatusInternalServerError, err)
 		return
 	}
 	write(w, actions)
 }
 func (s *Server) adminPreferences(w http.ResponseWriter, r *http.Request) {
-	session, ok := s.adminAllowed(r)
+	session, ok, err := s.adminAllowed(r)
 	if !ok {
-		fail(w, 403, errors.New("administrator access required"))
+		status := http.StatusForbidden
+		if err != nil && !errors.Is(err, errAdminRequired) {
+			status = http.StatusUnauthorized
+		}
+		fail(w, status, authorizationError(err, errAdminRequired))
 		return
 	}
 	preferences, err := s.Vault.GetUserPreferences(session.User.ID)
 	if err != nil {
+		log.Printf("admin preferences database query failed error=%v", err)
 		fail(w, 500, err)
 		return
 	}
 	write(w, preferences)
 }
 func (s *Server) updateAdminPreferences(w http.ResponseWriter, r *http.Request) {
-	session, ok := s.adminAllowed(r)
+	session, ok, err := s.adminAllowed(r)
 	if !ok {
-		fail(w, 403, errors.New("administrator access required"))
+		status := http.StatusForbidden
+		if err != nil && !errors.Is(err, errAdminRequired) {
+			status = http.StatusUnauthorized
+		}
+		fail(w, status, authorizationError(err, errAdminRequired))
 		return
 	}
 	preferences := map[string]bool{}
@@ -266,23 +285,45 @@ func (s *Server) updateAdminPreferences(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := s.Vault.SaveUserPreferences(session.User.ID, preferences); err != nil {
+		log.Printf("admin preferences database update failed error=%v", err)
 		fail(w, 500, err)
 		return
 	}
 	write(w, preferences)
 }
 
-func (s *Server) adminAllowed(r *http.Request) (auth.Session, bool) {
+func (s *Server) adminAllowed(r *http.Request) (auth.Session, bool, error) {
 	session, _, err := s.session(r)
-	return session, err == nil && s.AuditAdminGroup != "" && hasGroup(session.User.Groups, []string{s.AuditAdminGroup})
+	if err != nil {
+		log.Printf("admin authorization rejected error=%v", err)
+		return session, false, err
+	}
+	if s.AuditAdminGroup == "" || !hasGroup(session.User.Groups, []string{s.AuditAdminGroup}) {
+		log.Printf("admin authorization denied required_group=%q", s.AuditAdminGroup)
+		return session, false, errAdminRequired
+	}
+	return session, true, nil
 }
+
+func authorizationError(err, fallback error) error {
+	if err != nil {
+		return err
+	}
+	return fallback
+}
+
 func (s *Server) adminOrganizations(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.adminAllowed(r); !ok {
-		fail(w, http.StatusForbidden, errors.New("administrator access required"))
+	if _, ok, err := s.adminAllowed(r); !ok {
+		status := http.StatusForbidden
+		if err != nil && !errors.Is(err, errAdminRequired) {
+			status = http.StatusUnauthorized
+		}
+		fail(w, status, authorizationError(err, errAdminRequired))
 		return
 	}
 	organizations, err := s.Vault.ListOrganizations()
 	if err != nil {
+		log.Printf("admin organizations database query failed error=%v", err)
 		fail(w, 500, err)
 		return
 	}
@@ -303,9 +344,13 @@ func (s *Server) updateAdminOrganization(w http.ResponseWriter, r *http.Request)
 	s.saveAdminOrganization(w, r, true)
 }
 func (s *Server) saveAdminOrganization(w http.ResponseWriter, r *http.Request, update bool) {
-	session, ok := s.adminAllowed(r)
+	session, ok, err := s.adminAllowed(r)
 	if !ok {
-		fail(w, 403, errors.New("administrator access required"))
+		status := http.StatusForbidden
+		if err != nil && !errors.Is(err, errAdminRequired) {
+			status = http.StatusUnauthorized
+		}
+		fail(w, status, authorizationError(err, errAdminRequired))
 		return
 	}
 	var organization vault.Organization
@@ -320,6 +365,7 @@ func (s *Server) saveAdminOrganization(w http.ResponseWriter, r *http.Request, u
 	if update {
 		stored, err := s.Vault.ListOrganizations()
 		if err != nil {
+			log.Printf("admin organizations database query failed error=%v", err)
 			fail(w, 500, err)
 			return
 		}
@@ -338,6 +384,7 @@ func (s *Server) saveAdminOrganization(w http.ResponseWriter, r *http.Request, u
 		organization.Connections[name] = connection
 	}
 	if err := s.Vault.SaveOrganization(organization); err != nil {
+		log.Printf("admin organization database update failed operation=%s error=%v", map[bool]string{true: "update", false: "create"}[update], err)
 		fail(w, 500, err)
 		return
 	}
@@ -345,9 +392,13 @@ func (s *Server) saveAdminOrganization(w http.ResponseWriter, r *http.Request, u
 	write(w, publicOrganization(organization))
 }
 func (s *Server) deleteAdminOrganization(w http.ResponseWriter, r *http.Request) {
-	session, ok := s.adminAllowed(r)
+	session, ok, err := s.adminAllowed(r)
 	if !ok {
-		fail(w, 403, errors.New("administrator access required"))
+		status := http.StatusForbidden
+		if err != nil && !errors.Is(err, errAdminRequired) {
+			status = http.StatusUnauthorized
+		}
+		fail(w, status, authorizationError(err, errAdminRequired))
 		return
 	}
 	id := r.URL.Query().Get("id")
@@ -360,6 +411,7 @@ func (s *Server) deleteAdminOrganization(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := s.Vault.DeleteOrganization(id); err != nil {
+		log.Printf("admin organization database delete failed organization=%s error=%v", id, err)
 		fail(w, 500, err)
 		return
 	}
@@ -398,6 +450,7 @@ func auditTimeBoundary(value string, end bool) string {
 }
 
 func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
+	returnTo := s.Auth.ReturnPath(r)
 	user, id, err := s.Auth.Callback(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
@@ -408,7 +461,8 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(auth.Session{User: user}, "auth.login", "success", nil)
-	http.Redirect(w, r, "/", http.StatusFound)
+	s.Auth.ClearReturnPath(w)
+	http.Redirect(w, r, returnTo, http.StatusFound)
 }
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if session, _, ok := s.Auth.Current(r); ok {
@@ -573,7 +627,7 @@ func (s *Server) testConnection(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, errors.New("bucket is required"))
 		return
 	}
-	_, admin := s.adminAllowed(r)
+	_, admin, _ := s.adminAllowed(r)
 	var data vault.Data
 	var err error
 	if !(admin && c.AccessKey != "" && c.SecretKey != "") {
@@ -782,7 +836,9 @@ func (s *Server) organizationConfig() map[string]vault.Organization {
 func hasGroup(userGroups, required []string) bool {
 	for _, userGroup := range userGroups {
 		for _, group := range required {
-			if userGroup == group {
+			// OIDC providers differ on whether group claims contain the
+			// leading slash used by their directory representation.
+			if strings.TrimPrefix(userGroup, "/") == strings.TrimPrefix(group, "/") {
 				return true
 			}
 		}

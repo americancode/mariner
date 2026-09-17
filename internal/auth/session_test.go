@@ -26,3 +26,20 @@ func TestSessionSecretEmptyValue(t *testing.T) {
 		t.Fatalf("empty secret: %q err=%v", decoded, err)
 	}
 }
+
+func TestSafeReturnPath(t *testing.T) {
+	tests := []struct {
+		input, expected string
+	}{
+		{input: "/admin/audit", expected: "/admin/audit"},
+		{input: "/admin/audit?offset=10", expected: "/admin/audit?offset=10"},
+		{input: "https://evil.example/steal", expected: "/"},
+		{input: "//evil.example/steal", expected: "/"},
+		{input: "/\\\\evil.example/steal", expected: "/"},
+	}
+	for _, test := range tests {
+		if got := safeReturnPath(test.input); got != test.expected {
+			t.Errorf("safeReturnPath(%q) = %q, want %q", test.input, got, test.expected)
+		}
+	}
+}

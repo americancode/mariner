@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,7 +39,7 @@ type SessionStore interface {
 	SaveSession(id, userID, userName, groupsJSON, passwordCiphertext string, expiresAt time.Time) error
 	LoadSession(id string) (userID, userName, groupsJSON, passwordCiphertext string, expiresAt, lastSeenAt time.Time, found bool, err error)
 	DeleteSession(id string) error
-	TouchSession(id string, at time.Time) error
+	TouchSessionIfStale(id string, at, before time.Time) error
 }
 type Service struct {
 	Provider                *oidc.Provider
@@ -54,7 +55,10 @@ type Service struct {
 	sessionStore            SessionStore
 	sessions                map[string]Session // retained only for tests/standalone use
 	mu                      sync.RWMutex
+	touchMu                 sync.Mutex
 }
+
+const sessionTouchInterval = 30 * time.Second
 
 func (s *Service) SetSessionStore(store SessionStore) { s.sessionStore = store }
 
@@ -105,7 +109,9 @@ func discoverLogoutEndpoint(client *http.Client, issuer string) (string, error) 
 }
 func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
 	state := random(18)
+	returnTo := safeReturnPath(r.URL.Query().Get("return"))
 	s.setCookie(w, "mariner_state", state, 600)
+	s.setCookie(w, "mariner_return", returnTo, 600)
 	http.Redirect(w, r, s.OAuth.AuthCodeURL(state), http.StatusFound)
 }
 func (s *Service) Callback(r *http.Request) (User, string, error) {
@@ -121,7 +127,7 @@ func (s *Service) Callback(r *http.Request) (User, string, error) {
 		return User{}, "", errors.New("OIDC provider did not return an ID token")
 	}
 	if s.DebugJWT {
-		log.Printf("oidc: received id_token=%s", raw)
+		log.Printf("oidc: received ID token for validation")
 	}
 	verifyConfig := &oidc.Config{ClientID: s.OAuth.ClientID}
 	if s.AudienceClaim != "aud" {
@@ -137,7 +143,7 @@ func (s *Service) Callback(r *http.Request) (User, string, error) {
 		return User{}, "", errors.New("identity token has no subject")
 	}
 	if s.DebugJWT {
-		log.Printf("oidc: validated claims=%s", string(mustJSON(claims)))
+		log.Printf("oidc: ID token claims validated")
 	}
 	if s.AudienceClaim != "aud" && !contains(claimGroups(claims, s.AudienceClaim), s.Audience) {
 		log.Printf("oidc: audience mismatch claim=%q expected=%q", s.AudienceClaim, s.Audience)
@@ -163,7 +169,6 @@ func (s *Service) Callback(r *http.Request) (User, string, error) {
 	}
 	return User{ID: sub, Name: name, Groups: claimGroups(claims, s.GroupsClaim)}, random(24), nil
 }
-func mustJSON(value any) []byte { encoded, _ := json.Marshal(value); return encoded }
 func contains(values []string, expected string) bool {
 	for _, value := range values {
 		if value == expected {
@@ -206,14 +211,24 @@ func (s *Service) Current(r *http.Request) (Session, string, bool) {
 	if s.sessionStore != nil {
 		userID, userName, groupsJSON, encryptedPassword, expires, lastSeen, found, err := s.sessionStore.LoadSession(id)
 		now := time.Now()
+		if err != nil {
+			log.Printf("auth session load failed session_ref=%s error=%v", sessionRef(id), err)
+		}
 		if err != nil || !found || now.After(expires) || (s.SessionIdleTimeout > 0 && now.Sub(lastSeen) > s.SessionIdleTimeout) {
 			if found && (now.After(expires) || (s.SessionIdleTimeout > 0 && now.Sub(lastSeen) > s.SessionIdleTimeout)) {
+				log.Printf("auth session expired session_ref=%s reason=%s", sessionRef(id), sessionExpiryReason(now, expires, lastSeen, s.SessionIdleTimeout))
 				_ = s.sessionStore.DeleteSession(id)
 			}
 			return Session{}, id, false
 		}
-		if err := s.sessionStore.TouchSession(id, now); err != nil {
-			return Session{}, id, false
+		// Session validation remains read-first. Only one request in this
+		// process refreshes a stale session timestamp at a time, and the SQL
+		// predicate makes the update safe across replicas.
+		s.touchMu.Lock()
+		err = s.sessionStore.TouchSessionIfStale(id, now, now.Add(-sessionTouchInterval))
+		s.touchMu.Unlock()
+		if err != nil {
+			log.Printf("auth session touch failed session_ref=%s error=%v", sessionRef(id), err)
 		}
 		groups := []string{}
 		if json.Unmarshal([]byte(groupsJSON), &groups) != nil {
@@ -229,6 +244,21 @@ func (s *Service) Current(r *http.Request) (Session, string, bool) {
 	session, ok := s.sessions[id]
 	s.mu.RUnlock()
 	return session, id, ok && time.Now().Before(session.Expires)
+}
+
+func sessionRef(id string) string {
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:4])
+}
+
+func sessionExpiryReason(now, expires, lastSeen time.Time, idleTimeout time.Duration) string {
+	if now.After(expires) {
+		return "absolute_timeout"
+	}
+	if idleTimeout > 0 && now.Sub(lastSeen) > idleTimeout {
+		return "idle_timeout"
+	}
+	return "invalid"
 }
 func (s *Service) SetPassword(id, password string) error {
 	if s.sessionStore != nil {
@@ -337,12 +367,30 @@ func decryptSessionSecret(encoded, secret string) (string, error) {
 func EncryptForStorage(value, secret string) string { return encryptSessionSecret(value, secret) }
 
 // DecryptForStorage decrypts short-lived server-side secrets stored in SQL.
-func DecryptForStorage(encoded, secret string) (string, error) { return decryptSessionSecret(encoded, secret) }
+func DecryptForStorage(encoded, secret string) (string, error) {
+	return decryptSessionSecret(encoded, secret)
+}
 func (s *Service) setCookie(w http.ResponseWriter, name, value string, age int) {
 	mac := hmac.New(sha256.New, []byte(s.CookieSecret))
 	mac.Write([]byte(value))
 	signed := value + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	http.SetCookie(w, &http.Cookie{Name: name, Value: signed, Path: "/", MaxAge: age, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+}
+func (s *Service) ReturnPath(r *http.Request) string {
+	return safeReturnPath(s.cookie(r, "mariner_return"))
+}
+func (s *Service) ClearReturnPath(w http.ResponseWriter) {
+	s.setCookie(w, "mariner_return", "", -1)
+}
+func safeReturnPath(value string) string {
+	if value == "" {
+		return "/"
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || strings.ContainsAny(value, "\r\n\\") || parsed.IsAbs() || parsed.Host != "" || !strings.HasPrefix(parsed.Path, "/") || strings.HasPrefix(parsed.Path, "//") {
+		return "/"
+	}
+	return parsed.RequestURI()
 }
 func (s *Service) cookie(r *http.Request, name string) string {
 	c, err := r.Cookie(name)
