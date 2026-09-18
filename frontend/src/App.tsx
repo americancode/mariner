@@ -61,6 +61,7 @@ type Activity = {
   lastModified?: number;
   uploadId?: string;
   uploadKey?: string;
+  completedAt?: number;
 };
 type ActivitySetter = React.Dispatch<React.SetStateAction<Activity[]>>;
 const auditColumns = [
@@ -73,7 +74,10 @@ function loadActivities(storageKey: string): Activity[] {
   try {
     const stored = JSON.parse(window.localStorage.getItem(storageKey) || "[]");
     if (!Array.isArray(stored)) return [];
-    return stored.map((activity: Activity) => {
+    const cutoff = Date.now() - 60_000;
+    return stored.filter((activity: Activity) =>
+      activity.state !== "done" || !activity.completedAt || activity.completedAt > cutoff,
+    ).map((activity: Activity) => {
       if (activity.state !== "active") return activity;
       return activity.kind === "upload"
         ? { ...activity, state: "paused", error: "Interrupted. Select the file again to resume." }
@@ -721,6 +725,18 @@ function Workspace({
       // Activity persistence is best effort and must not interrupt file work.
     }
   }, [activities, activityStorageKey]);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const cutoff = Date.now() - 60_000;
+      setActivities((current) => {
+        const next = current.filter((activity) =>
+          activity.state !== "done" || !activity.completedAt || activity.completedAt > cutoff,
+        );
+        return next.length === current.length ? current : next;
+      });
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, []);
   async function dismissActivity(id: string) {
     const activity = activities.find((item) => item.id === id);
     if (
@@ -1258,7 +1274,7 @@ function Explorer({
       URL.revokeObjectURL(url);
       setActivities((current) =>
         current.map((item) =>
-          item.id === id ? { ...item, progress: 100, state: "done" } : item,
+          item.id === id ? { ...item, progress: 100, state: "done", completedAt: Date.now() } : item,
         ),
       );
     } catch (err) {
@@ -1338,7 +1354,7 @@ function Explorer({
           setActivities((current) =>
             current.map((activity) =>
               activity.id === id
-                ? { ...activity, progress: 100, state: "done" }
+                ? { ...activity, progress: 100, state: "done", completedAt: Date.now() }
                 : activity,
             ),
           );
@@ -1430,7 +1446,7 @@ function Explorer({
           );
           setActivities((current) =>
             current.map((item) =>
-              item.id === id ? { ...item, progress: 100, state: "done" } : item,
+              item.id === id ? { ...item, progress: 100, state: "done", completedAt: Date.now() } : item,
             ),
           );
         } catch (err) {
@@ -1623,7 +1639,7 @@ function Explorer({
               setActivities((current) =>
                 current.map((item) =>
                   item.id === id
-                    ? { ...item, progress: 100, state: "done" }
+                    ? { ...item, progress: 100, state: "done", completedAt: Date.now() }
                     : item,
                 ),
               );

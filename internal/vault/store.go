@@ -52,6 +52,7 @@ type envelope struct{ Salt, Nonce, Ciphertext string }
 type Store struct {
 	db              *sqlx.DB
 	mu              sync.Mutex
+	writeDB         *sqlx.DB
 	organizationKey string
 }
 
@@ -142,7 +143,7 @@ func OpenDatabase(driver, dir, databaseURL string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := &Store{db: db}
+	store := &Store{db: db, writeDB: db}
 	if err = store.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -154,13 +155,20 @@ func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
-	db, err := sqlx.Open("sqlite", filepath.Join(dir, "mariner.db"))
+	db, err := sqlx.Open("sqlite", filepath.Join(dir, "mariner.db")+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, err
 	}
-	store := &Store{db: db}
+	writeDB, err := sqlx.Open("sqlite", filepath.Join(dir, "mariner.db")+"?_journal_mode=WAL&_busy_timeout=5000")
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	writeDB.SetMaxOpenConns(1)
+	store := &Store{db: db, writeDB: writeDB}
 	if err = store.migrate(); err != nil {
 		db.Close()
+		writeDB.Close()
 		return nil, err
 	}
 	return store, nil
@@ -175,11 +183,11 @@ func (s *Store) migrate() error {
 		`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, user_name TEXT NOT NULL, groups_json TEXT NOT NULL, password_ciphertext TEXT NOT NULL, expires_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS multipart_uploads (upload_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, connection_id TEXT NOT NULL, bucket TEXT NOT NULL, object_key TEXT NOT NULL, status TEXT NOT NULL, next_part INTEGER NOT NULL, parts_json TEXT NOT NULL, hash_state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 	} {
-		if _, err := s.db.Exec(statement); err != nil {
+		if _, err := s.writeDB.Exec(statement); err != nil {
 			return err
 		}
 	}
-	if _, err := s.db.Exec(s.db.Rebind(`ALTER TABLE multipart_uploads ADD COLUMN connection_ciphertext TEXT NOT NULL DEFAULT ''`)); err != nil {
+	if _, err := s.writeDB.Exec(s.writeDB.Rebind(`ALTER TABLE multipart_uploads ADD COLUMN connection_ciphertext TEXT NOT NULL DEFAULT ''`)); err != nil {
 		message := strings.ToLower(err.Error())
 		if !strings.Contains(message, "duplicate") && !strings.Contains(message, "already exists") {
 			return err
@@ -190,7 +198,7 @@ func (s *Store) migrate() error {
 
 func (s *Store) SaveSession(id, userID, userName, groupsJSON, passwordCiphertext string, expiresAt time.Time) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.db.Exec(s.db.Rebind(`INSERT INTO sessions(id,user_id,user_name,groups_json,password_ciphertext,expires_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id,user_name=excluded.user_name,groups_json=excluded.groups_json,password_ciphertext=excluded.password_ciphertext,expires_at=excluded.expires_at,updated_at=excluded.updated_at`), id, userID, userName, groupsJSON, passwordCiphertext, expiresAt.UTC().Format(time.RFC3339Nano), now)
+	_, err := s.writeDB.Exec(s.writeDB.Rebind(`INSERT INTO sessions(id,user_id,user_name,groups_json,password_ciphertext,expires_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id,user_name=excluded.user_name,groups_json=excluded.groups_json,password_ciphertext=excluded.password_ciphertext,expires_at=excluded.expires_at,updated_at=excluded.updated_at`), id, userID, userName, groupsJSON, passwordCiphertext, expiresAt.UTC().Format(time.RFC3339Nano), now)
 	return err
 }
 
@@ -213,18 +221,18 @@ func (s *Store) LoadSession(id string) (userID, userName, groupsJSON, passwordCi
 }
 
 func (s *Store) TouchSessionIfStale(id string, at, before time.Time) error {
-	_, err := s.db.Exec(s.db.Rebind(`UPDATE sessions SET updated_at=? WHERE id=? AND updated_at < ?`), at.UTC().Format(time.RFC3339Nano), id, before.UTC().Format(time.RFC3339Nano))
+	_, err := s.writeDB.Exec(s.writeDB.Rebind(`UPDATE sessions SET updated_at=? WHERE id=? AND updated_at < ?`), at.UTC().Format(time.RFC3339Nano), id, before.UTC().Format(time.RFC3339Nano))
 	return err
 }
 
 func (s *Store) DeleteSession(id string) error {
-	_, err := s.db.Exec(s.db.Rebind(`DELETE FROM sessions WHERE id=?`), id)
+	_, err := s.writeDB.Exec(s.writeDB.Rebind(`DELETE FROM sessions WHERE id=?`), id)
 	return err
 }
 
 func (s *Store) CreateMultipartUpload(upload MultipartUpload) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.db.Exec(s.db.Rebind(`INSERT INTO multipart_uploads(upload_id,user_id,connection_id,bucket,object_key,status,next_part,parts_json,hash_state,created_at,updated_at,connection_ciphertext) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`), upload.UploadID, upload.UserID, upload.ConnectionID, upload.Bucket, upload.Key, "active", 1, "[]", upload.HashState, now, now, upload.ConnectionCiphertext)
+	_, err := s.writeDB.Exec(s.writeDB.Rebind(`INSERT INTO multipart_uploads(upload_id,user_id,connection_id,bucket,object_key,status,next_part,parts_json,hash_state,created_at,updated_at,connection_ciphertext) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`), upload.UploadID, upload.UserID, upload.ConnectionID, upload.Bucket, upload.Key, "active", 1, "[]", upload.HashState, now, now, upload.ConnectionCiphertext)
 	return err
 }
 
@@ -255,7 +263,7 @@ func (s *Store) ListStaleMultipartUploads(before time.Time) ([]MultipartUpload, 
 }
 
 func (s *Store) ClaimMultipartCleanup(id string, before time.Time) (bool, error) {
-	result, err := s.db.Exec(s.db.Rebind(`UPDATE multipart_uploads SET status='cleaning' WHERE upload_id=? AND status IN ('active','completing','cleaning') AND updated_at < ?`), id, before.UTC().Format(time.RFC3339Nano))
+	result, err := s.writeDB.Exec(s.writeDB.Rebind(`UPDATE multipart_uploads SET status='cleaning' WHERE upload_id=? AND status IN ('active','completing','cleaning') AND updated_at < ?`), id, before.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return false, err
 	}
@@ -264,7 +272,7 @@ func (s *Store) ClaimMultipartCleanup(id string, before time.Time) (bool, error)
 }
 
 func (s *Store) SaveMultipartPart(id string, expectedPart int32, partsJSON, hashState string) (bool, error) {
-	result, err := s.db.Exec(s.db.Rebind(`UPDATE multipart_uploads SET next_part=next_part+1,parts_json=?,hash_state=?,updated_at=? WHERE upload_id=? AND status='active' AND next_part=?`), partsJSON, hashState, time.Now().UTC().Format(time.RFC3339Nano), id, expectedPart)
+	result, err := s.writeDB.Exec(s.writeDB.Rebind(`UPDATE multipart_uploads SET next_part=next_part+1,parts_json=?,hash_state=?,updated_at=? WHERE upload_id=? AND status='active' AND next_part=?`), partsJSON, hashState, time.Now().UTC().Format(time.RFC3339Nano), id, expectedPart)
 	if err != nil {
 		return false, err
 	}
@@ -273,7 +281,7 @@ func (s *Store) SaveMultipartPart(id string, expectedPart int32, partsJSON, hash
 }
 
 func (s *Store) ClaimMultipartComplete(id string) (MultipartUpload, bool, error) {
-	result, err := s.db.Exec(s.db.Rebind(`UPDATE multipart_uploads SET status='completing',updated_at=? WHERE upload_id=? AND status='active' AND next_part>1`), time.Now().UTC().Format(time.RFC3339Nano), id)
+	result, err := s.writeDB.Exec(s.writeDB.Rebind(`UPDATE multipart_uploads SET status='completing',updated_at=? WHERE upload_id=? AND status='active' AND next_part>1`), time.Now().UTC().Format(time.RFC3339Nano), id)
 	if err != nil {
 		return MultipartUpload{}, false, err
 	}
@@ -289,12 +297,12 @@ func (s *Store) FinishMultipartUpload(id string, success bool) error {
 	if success {
 		status = "complete"
 	}
-	_, err := s.db.Exec(s.db.Rebind(`UPDATE multipart_uploads SET status=?,updated_at=? WHERE upload_id=? AND status='completing'`), status, time.Now().UTC().Format(time.RFC3339Nano), id)
+	_, err := s.writeDB.Exec(s.writeDB.Rebind(`UPDATE multipart_uploads SET status=?,updated_at=? WHERE upload_id=? AND status='completing'`), status, time.Now().UTC().Format(time.RFC3339Nano), id)
 	return err
 }
 
 func (s *Store) DeleteMultipartUpload(id string) error {
-	_, err := s.db.Exec(s.db.Rebind(`DELETE FROM multipart_uploads WHERE upload_id=?`), id)
+	_, err := s.writeDB.Exec(s.writeDB.Rebind(`DELETE FROM multipart_uploads WHERE upload_id=?`), id)
 	return err
 }
 func (s *Store) GetUserPreferences(userID string) (map[string]bool, error) {
@@ -314,7 +322,7 @@ func (s *Store) SaveUserPreferences(userID string, settings map[string]bool) err
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(s.db.Rebind(`INSERT INTO user_preferences(user_id, settings_json, updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET settings_json=excluded.settings_json, updated_at=excluded.updated_at`), userID, string(raw), time.Now().UTC().Format(time.RFC3339))
+	_, err = s.writeDB.Exec(s.writeDB.Rebind(`INSERT INTO user_preferences(user_id, settings_json, updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET settings_json=excluded.settings_json, updated_at=excluded.updated_at`), userID, string(raw), time.Now().UTC().Format(time.RFC3339))
 	return err
 }
 func (s *Store) SetOrganizationEncryptionKey(key string) { s.organizationKey = key }
@@ -362,14 +370,14 @@ func (s *Store) SaveOrganization(organization Organization) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err = s.db.Exec(s.db.Rebind(`INSERT INTO organizations(id, encrypted, updated_at) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET encrypted=excluded.encrypted, updated_at=excluded.updated_at`), organization.ID, encrypted, time.Now().UTC().Format(time.RFC3339))
+	_, err = s.writeDB.Exec(s.writeDB.Rebind(`INSERT INTO organizations(id, encrypted, updated_at) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET encrypted=excluded.encrypted, updated_at=excluded.updated_at`), organization.ID, encrypted, time.Now().UTC().Format(time.RFC3339))
 	return err
 }
 
 func (s *Store) DeleteOrganization(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(s.db.Rebind("DELETE FROM organizations WHERE id = ?"), id)
+	_, err := s.writeDB.Exec(s.writeDB.Rebind("DELETE FROM organizations WHERE id = ?"), id)
 	return err
 }
 
@@ -420,8 +428,6 @@ func (s *Store) Exists(userID string) (bool, error) {
 	return count > 0, err
 }
 func (s *Store) Load(userID, password string) (Data, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	var e envelope
 	err := s.db.QueryRowx(s.db.Rebind("SELECT salt, nonce, ciphertext FROM vaults WHERE user_id = ?"), userID).Scan(&e.Salt, &e.Nonce, &e.Ciphertext)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -440,13 +446,13 @@ func (s *Store) Save(userID, password string, data Data) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(s.db.Rebind(`INSERT INTO vaults(user_id,salt,nonce,ciphertext,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET salt=excluded.salt,nonce=excluded.nonce,ciphertext=excluded.ciphertext,updated_at=excluded.updated_at`), userID, e.Salt, e.Nonce, e.Ciphertext, time.Now().UTC().Format(time.RFC3339))
+	_, err = s.writeDB.Exec(s.writeDB.Rebind(`INSERT INTO vaults(user_id,salt,nonce,ciphertext,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET salt=excluded.salt,nonce=excluded.nonce,ciphertext=excluded.ciphertext,updated_at=excluded.updated_at`), userID, e.Salt, e.Nonce, e.Ciphertext, time.Now().UTC().Format(time.RFC3339))
 	return err
 }
 func (s *Store) Delete(userID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(s.db.Rebind("DELETE FROM vaults WHERE user_id = ?"), userID)
+	_, err := s.writeDB.Exec(s.writeDB.Rebind("DELETE FROM vaults WHERE user_id = ?"), userID)
 	return err
 }
 func (s *Store) AppendAudit(event AuditEvent) (string, error) {
@@ -456,7 +462,7 @@ func (s *Store) AppendAudit(event AuditEvent) (string, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err = s.db.Exec(s.db.Rebind(`INSERT INTO audit_events(event_id, occurred_at, event_json) VALUES(?,?,?)`), event.ID, event.OccurredAt, string(raw))
+	_, err = s.writeDB.Exec(s.writeDB.Rebind(`INSERT INTO audit_events(event_id, occurred_at, event_json) VALUES(?,?,?)`), event.ID, event.OccurredAt, string(raw))
 	return string(raw), err
 }
 
@@ -535,7 +541,15 @@ func (s *Store) ListAuditActions() ([]string, error) {
 	}
 	return actions, nil
 }
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	err := s.db.Close()
+	if s.writeDB != s.db {
+		if closeErr := s.writeDB.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
+}
 
 func key(password string, salt []byte) []byte {
 	return argon2.IDKey([]byte(password), salt, 3, 64*1024, 2, 32)

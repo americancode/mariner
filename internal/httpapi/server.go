@@ -1099,6 +1099,7 @@ func (s *Server) uploadInit(w http.ResponseWriter, r *http.Request) {
 	hashState, _ := marshalHash(sha256.New())
 	connectionJSON, _ := json.Marshal(c)
 	if err := s.Vault.CreateMultipartUpload(vault.MultipartUpload{UploadID: aws.ToString(created.UploadId), UserID: session.User.ID, ConnectionID: c.ID, Bucket: c.Bucket, Key: key, HashState: hashState, ConnectionCiphertext: auth.EncryptForStorage(string(connectionJSON), s.Auth.CookieSecret)}); err != nil {
+		log.Printf("multipart state create failed upload=%s error=%v", aws.ToString(created.UploadId), err)
 		_, _ = client.AbortMultipartUpload(r.Context(), &s3.AbortMultipartUploadInput{Bucket: aws.String(c.Bucket), Key: aws.String(key), UploadId: created.UploadId})
 		fail(w, http.StatusInternalServerError, err)
 		return
@@ -1120,6 +1121,7 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 	}
 	record, ok, err := s.Vault.LoadMultipartUpload(uploadID)
 	if err != nil {
+		log.Printf("multipart state load failed operation=part upload=%s error=%v", uploadID, err)
 		fail(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -1175,6 +1177,7 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 	partsJSON, _ := json.Marshal(parts)
 	updated, err := s.Vault.SaveMultipartPart(uploadID, int32(partNumber), string(partsJSON), hashState)
 	if err != nil {
+		log.Printf("multipart state part advance failed upload=%s part=%d error=%v", uploadID, partNumber, err)
 		fail(w, 500, err)
 		return
 	}
@@ -1198,6 +1201,7 @@ func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	current, ok, err := s.Vault.LoadMultipartUpload(uploadID)
 	if err != nil {
+		log.Printf("multipart state load failed operation=complete upload=%s error=%v", uploadID, err)
 		fail(w, 500, err)
 		return
 	}
@@ -1207,6 +1211,7 @@ func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	state, ok, err := s.Vault.ClaimMultipartComplete(uploadID)
 	if err != nil {
+		log.Printf("multipart state complete claim failed upload=%s error=%v", uploadID, err)
 		fail(w, 500, err)
 		return
 	}
@@ -1216,30 +1221,42 @@ func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	c, err := s.connectionValue(r.URL.Query().Get("connection"), data, session.User)
 	if err != nil {
-		_ = s.Vault.FinishMultipartUpload(uploadID, false)
+		if finishErr := s.Vault.FinishMultipartUpload(uploadID, false); finishErr != nil {
+			log.Printf("multipart state finish failed upload=%s success=false error=%v", uploadID, finishErr)
+		}
 		fail(w, http.StatusNotFound, err)
 		return
 	}
 	client, err := s3client.New(r.Context(), c)
 	if err != nil {
-		_ = s.Vault.FinishMultipartUpload(uploadID, false)
+		if finishErr := s.Vault.FinishMultipartUpload(uploadID, false); finishErr != nil {
+			log.Printf("multipart state finish failed upload=%s success=false error=%v", uploadID, finishErr)
+		}
 		fail(w, http.StatusInternalServerError, err)
 		return
 	}
 	var parts []types.CompletedPart
 	if err = json.Unmarshal([]byte(state.PartsJSON), &parts); err != nil {
-		_ = s.Vault.FinishMultipartUpload(uploadID, false)
+		if finishErr := s.Vault.FinishMultipartUpload(uploadID, false); finishErr != nil {
+			log.Printf("multipart state finish failed upload=%s success=false error=%v", uploadID, finishErr)
+		}
 		fail(w, 500, err)
 		return
 	}
 	_, err = client.CompleteMultipartUpload(r.Context(), &s3.CompleteMultipartUploadInput{Bucket: aws.String(state.Bucket), Key: aws.String(state.Key), UploadId: aws.String(uploadID), MultipartUpload: &types.CompletedMultipartUpload{Parts: parts}})
 	if err != nil {
 		_, _ = client.AbortMultipartUpload(r.Context(), &s3.AbortMultipartUploadInput{Bucket: aws.String(state.Bucket), Key: aws.String(state.Key), UploadId: aws.String(uploadID)})
-		_ = s.Vault.FinishMultipartUpload(uploadID, false)
+		if finishErr := s.Vault.FinishMultipartUpload(uploadID, false); finishErr != nil {
+			log.Printf("multipart state finish failed upload=%s success=false error=%v", uploadID, finishErr)
+		}
 		fail(w, http.StatusBadGateway, err)
 		return
 	}
-	_ = s.Vault.FinishMultipartUpload(uploadID, true)
+	if err := s.Vault.FinishMultipartUpload(uploadID, true); err != nil {
+		log.Printf("multipart state finish failed upload=%s success=true error=%v", uploadID, err)
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
 	hasher, err := unmarshalHash(state.HashState)
 	if err != nil {
 		fail(w, 500, err)
@@ -1259,6 +1276,7 @@ func (s *Server) uploadAbort(w http.ResponseWriter, r *http.Request) {
 	uploadID := r.URL.Query().Get("uploadId")
 	state, ok, err := s.Vault.LoadMultipartUpload(uploadID)
 	if err != nil {
+		log.Printf("multipart state load failed operation=abort upload=%s error=%v", uploadID, err)
 		fail(w, 500, err)
 		return
 	}
@@ -1281,6 +1299,7 @@ func (s *Server) uploadAbort(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err = s.Vault.DeleteMultipartUpload(uploadID); err != nil {
+		log.Printf("multipart state delete failed operation=abort upload=%s error=%v", uploadID, err)
 		fail(w, http.StatusInternalServerError, err)
 		return
 	}

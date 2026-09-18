@@ -1,6 +1,8 @@
 package vault
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -72,6 +74,142 @@ func TestSQLSessionTouchOnlyUpdatesStaleSession(t *testing.T) {
 	}
 	if !updated.Equal(stale) {
 		t.Fatalf("stale session was not updated: got %s want %s", updated, stale)
+	}
+}
+
+func TestSQLiteConcurrentMultipartWritesDoNotLockOrLoseState(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	const uploads = 24
+	for i := 0; i < uploads; i++ {
+		id := fmt.Sprintf("upload-%d", i)
+		if err := store.CreateMultipartUpload(MultipartUpload{UploadID: id, UserID: "user-1", ConnectionID: "connection-1", Bucket: "bucket", Key: id, HashState: "hash-0"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	errs := make(chan error, uploads)
+	var wg sync.WaitGroup
+	for i := 0; i < uploads; i++ {
+		id := fmt.Sprintf("upload-%d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for part := int32(1); part <= 4; part++ {
+				parts := fmt.Sprintf(`[{"PartNumber":%d,"ETag":"etag-%d"}]`, part, part)
+				updated, err := store.SaveMultipartPart(id, part, parts, fmt.Sprintf("hash-%d", part))
+				if err != nil {
+					errs <- err
+					return
+				}
+				if !updated {
+					errs <- fmt.Errorf("part %d was not advanced", part)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	for i := 0; i < uploads; i++ {
+		upload, found, err := store.LoadMultipartUpload(fmt.Sprintf("upload-%d", i))
+		if err != nil || !found || upload.NextPart != 5 {
+			t.Fatalf("upload %d final state: %+v found=%v err=%v", i, upload, found, err)
+		}
+	}
+}
+
+func TestSQLiteConcurrentSameMultipartPartAdvancesOnce(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.CreateMultipartUpload(MultipartUpload{UploadID: "upload-1", UserID: "user-1", ConnectionID: "connection-1", Bucket: "bucket", Key: "file", HashState: "hash-0"}); err != nil {
+		t.Fatal(err)
+	}
+
+	const attempts = 16
+	results := make(chan bool, attempts)
+	errs := make(chan error, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			updated, err := store.SaveMultipartPart("upload-1", 1, `[{"PartNumber":1,"ETag":"etag"}]`, "hash-1")
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- updated
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	updatedCount := 0
+	for updated := range results {
+		if updated {
+			updatedCount++
+		}
+	}
+	if updatedCount != 1 {
+		t.Fatalf("expected exactly one successful part advance, got %d", updatedCount)
+	}
+	upload, found, err := store.LoadMultipartUpload("upload-1")
+	if err != nil || !found || upload.NextPart != 2 {
+		t.Fatalf("unexpected final upload state: %+v found=%v err=%v", upload, found, err)
+	}
+}
+
+func TestSQLiteConcurrentSessionTouchesDoNotLock(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.SaveSession("session-1", "user-1", "Demo", `[]`, "", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, _, initial, found, err := store.LoadSession("session-1")
+	if err != nil || !found {
+		t.Fatalf("load session: found=%v err=%v", found, err)
+	}
+
+	const attempts = 32
+	errs := make(chan error, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- store.TouchSessionIfStale("session-1", initial.Add(time.Minute), initial.Add(30*time.Second))
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	_, _, _, _, _, updated, found, err := store.LoadSession("session-1")
+	if err != nil || !found || !updated.Equal(initial.Add(time.Minute)) {
+		t.Fatalf("unexpected final session timestamp: %s found=%v err=%v", updated, found, err)
 	}
 }
 
