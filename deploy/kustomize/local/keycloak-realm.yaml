@@ -30,14 +30,13 @@ data:
           }
         }]
       }],
-      "groups": [{"name": "admins"}, {"name": "ORG1"}],
+      "groups": [{"name": "admins"}],
       "users": [{
         "username": "demo",
         "enabled": true,
         "email": "demo@example.com",
         "firstName": "Demo",
         "lastName": "User",
-        "groups": ["/ORG1"],
         "credentials": [{"type": "password", "value": "DemoPassword123!", "temporary": false}]
       }, {
         "username": "mariner-admin",
@@ -45,7 +44,7 @@ data:
         "email": "mariner-admin@example.com",
         "firstName": "Mariner",
         "lastName": "Administrator",
-        "groups": ["/admins", "/ORG1"],
+        "groups": ["/admins"],
         "credentials": [{"type": "password", "value": "MarinerAppAdmin123!", "temporary": false}]
       }]
     }

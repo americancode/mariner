@@ -1,13 +1,4 @@
-# PostgreSQL-backed deployments may run multiple replicas. SQLite deployments
-# must remain single-replica because the application database is file-local.
 replicaCount: 1
-# How long an unlocked session may be idle before the vault must be unlocked.
-# Uses Go duration syntax, for example 30m, 1h, or 15m30s.
-sessionIdleTimeout: 30m
-multipartCleanup:
-  enabled: true
-  interval: 15m
-  maxAge: 12h
 image:
   repository: ghcr.io/example/mariner
   # Empty uses the chart's appVersion.
@@ -55,8 +46,8 @@ ingress:
       hosts:
         - mariner.127.0.0.1.sslip.io
 database:
-  # postgres is the default and supports shared sessions and multipart state
-  # across replicas. SQLite is for lightweight single-replica deployments.
+  # postgres is the default. Set driver: sqlite for lightweight
+  # single-replica deployments.
   driver: postgres
   url: ""
   # PostgreSQL TLS mode is chart configuration, not a database Secret field.
@@ -147,13 +138,11 @@ caBundle:
   # appended to the platform trust pool by tlsconfig.RootCAs.
 cookieSecret: ""
 audit:
-  # Enables database audit event recording in Mariner. The forwarder is only
-  # enabled when this is true and audit.forwarder.enabled is also true.
   enabled: true
-  forwarder:
-    # Enables audit forwarding. PostgreSQL uses one standalone forwarder pod;
-    # SQLite runs the same forwarder as a Mariner sidecar so its RWO PVC stays
-    # on one pod/node. Set false when another collector reads SQL.
+  sidecar:
+    # The default polls the database for new audit rows and writes their exact
+    # event_json to stdout for Alloy/Loki. Replace image/command/args for a
+    # direct Splunk HEC shipper.
     enabled: true
     pollingInterval: 2s
     batchSize: 100

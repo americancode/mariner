@@ -27,7 +27,6 @@ type User = { authenticated: boolean; name?: string; isAdmin?: boolean };
 type ErrorHandler = (message: string) => void;
 const promptUnlockAfterSignInKey = "mariner_prompt_unlock_after_sign_in";
 const themeStorageKey = "mariner.theme";
-const activityStoragePrefix = "mariner.activities";
 
 function storedThemeIsDark() {
   return window.localStorage.getItem(themeStorageKey) === "dark";
@@ -37,6 +36,9 @@ function markSignOut() {
   sessionStorage.setItem(promptUnlockAfterSignInKey, "true");
 }
 
+function promptUnlockOnReturn() {
+  sessionStorage.setItem(promptUnlockAfterSignInKey, "true");
+}
 type ConnectionForm = {
   id?: string;
   name: string;
@@ -52,16 +54,8 @@ type Activity = {
   label: string;
   kind: "upload" | "delete" | "download";
   progress: number;
-  state: "active" | "paused" | "done" | "error";
+  state: "active" | "done" | "error";
   error?: string;
-  connectionId?: string;
-  prefix?: string;
-  fileName?: string;
-  fileSize?: number;
-  lastModified?: number;
-  uploadId?: string;
-  uploadKey?: string;
-  completedAt?: number;
 };
 type ActivitySetter = React.Dispatch<React.SetStateAction<Activity[]>>;
 const auditColumns = [
@@ -69,24 +63,6 @@ const auditColumns = [
   ["bucket", "Bucket"], ["object", "Object"], ["result", "Result"],
   ["sha256", "SHA-256"],
 ] as const;
-
-function loadActivities(storageKey: string): Activity[] {
-  try {
-    const stored = JSON.parse(window.localStorage.getItem(storageKey) || "[]");
-    if (!Array.isArray(stored)) return [];
-    const cutoff = Date.now() - 60_000;
-    return stored.filter((activity: Activity) =>
-      activity.state !== "done" || !activity.completedAt || activity.completedAt > cutoff,
-    ).map((activity: Activity) => {
-      if (activity.state !== "active") return activity;
-      return activity.kind === "upload"
-        ? { ...activity, state: "paused", error: "Interrupted. Select the file again to resume." }
-        : { ...activity, state: "error", error: "Interrupted by page refresh." };
-    });
-  } catch {
-    return [];
-  }
-}
 
 export function App() {
   const [user, setUser] = useState<User>();
@@ -136,13 +112,14 @@ export function App() {
       return;
     api
       .status()
-	  .then(async ({ exists, unlocked }) => {
-	        setVaultExists(exists);
-	        setVaultUnlocked(unlocked);
-	        if (unlocked) {
-	          setConnections(await api.connections());
-	        }
-	        setUnlockOpen(!exists || !unlocked);
+      .then(({ exists }) => {
+        setVaultExists(exists);
+        const promptAfterSignIn =
+          sessionStorage.getItem(promptUnlockAfterSignInKey) === "true";
+        if (promptAfterSignIn) {
+          sessionStorage.removeItem(promptUnlockAfterSignInKey);
+        }
+        setUnlockOpen(!exists || promptAfterSignIn);
       })
       .catch((err) => setError(errorMessage(err)));
   }, [user]);
@@ -284,7 +261,6 @@ export function App() {
       />
       <Workspace
         connection={activeConnection}
-        connections={connections}
         loading={loading}
         prefix={prefix}
         items={items}
@@ -297,7 +273,6 @@ export function App() {
         itemFilter={itemFilter}
         vaultUnlocked={vaultUnlocked}
         onUnlock={() => setUnlockOpen(true)}
-        activityStorageKey={`${activityStoragePrefix}:${user.name || "unknown"}`}
         onFilterChange={(kind) => {
           setItemFilter(kind);
           if (activeConnection) browse(activeConnection, prefix, kind);
@@ -377,7 +352,7 @@ function AdminPage() {
           <a className={auditPage ? "active" : ""} href="/admin/audit">Audit logs</a>
           <a className={organizationsPage ? "active" : ""} href="/admin/organizations">Organizations</a>
         </nav>
-        <a className="secondary admin-back" href="/">
+        <a className="secondary admin-back" href="/" onClick={promptUnlockOnReturn}>
           Back to Mariner
         </a>
       </aside>
@@ -684,7 +659,6 @@ function Sidebar({
 
 function Workspace({
   connection,
-  connections,
   loading,
   prefix,
   items,
@@ -698,10 +672,8 @@ function Workspace({
   vaultUnlocked,
   onUnlock,
   onFilterChange,
-  activityStorageKey,
 }: {
   connection?: Connection;
-  connections: Connection[];
   loading: boolean;
   prefix: string;
   items: Item[];
@@ -715,50 +687,8 @@ function Workspace({
   vaultUnlocked: boolean;
   onUnlock: () => void;
   onFilterChange: (kind: BrowseKind) => void;
-  activityStorageKey: string;
 }) {
-  const [activities, setActivities] = useState<Activity[]>(() => loadActivities(activityStorageKey));
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(activityStorageKey, JSON.stringify(activities.slice(-100)));
-    } catch {
-      // Activity persistence is best effort and must not interrupt file work.
-    }
-  }, [activities, activityStorageKey]);
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      const cutoff = Date.now() - 60_000;
-      setActivities((current) => {
-        const next = current.filter((activity) =>
-          activity.state !== "done" || !activity.completedAt || activity.completedAt > cutoff,
-        );
-        return next.length === current.length ? current : next;
-      });
-    }, 5_000);
-    return () => window.clearInterval(timer);
-  }, []);
-  async function dismissActivity(id: string) {
-    const activity = activities.find((item) => item.id === id);
-    if (
-      activity?.kind === "upload" &&
-      activity.state !== "done" &&
-      activity.uploadId
-    ) {
-      try {
-        await api.abortUpload(activity.uploadId);
-      } catch (err) {
-        setActivities((current) =>
-          current.map((item) =>
-            item.id === id
-              ? { ...item, state: "error", error: `Cleanup failed: ${errorMessage(err)}` }
-              : item,
-          ),
-        );
-        return;
-      }
-    }
-    setActivities((current) => current.filter((item) => item.id !== id));
-  }
+  const [activities, setActivities] = useState<Activity[]>([]);
   return (
     <main className="content">
       <header>
@@ -780,10 +710,8 @@ function Workspace({
         ) : (
           <Explorer
             connection={connection}
-            connections={connections}
             prefix={prefix}
             items={items}
-            activities={activities}
             setActivities={setActivities}
             onBrowse={onBrowse}
             onRefresh={onRefresh}
@@ -793,7 +721,6 @@ function Workspace({
             loadingMore={loadingMore}
             itemFilter={itemFilter}
             onFilterChange={onFilterChange}
-            onDismissActivity={dismissActivity}
           />
         )
       ) : (
@@ -812,6 +739,12 @@ function Workspace({
           )}
         </section>
       )}
+      <ActivityTray
+        activities={activities}
+        onDismiss={(id) =>
+          setActivities((current) => current.filter((item) => item.id !== id))
+        }
+      />
     </main>
   );
 }
@@ -1194,10 +1127,8 @@ function ConnectionModal({
 
 function Explorer({
   connection,
-  connections,
   prefix,
   items,
-  activities,
   setActivities,
   onBrowse,
   onRefresh,
@@ -1207,13 +1138,10 @@ function Explorer({
   loadingMore,
   itemFilter,
   onFilterChange,
-  onDismissActivity,
 }: {
   connection: Connection;
-  connections: Connection[];
   prefix: string;
   items: Item[];
-  activities: Activity[];
   setActivities: ActivitySetter;
   onBrowse: (connection: Connection, prefix?: string) => void;
   onRefresh: () => Promise<void>;
@@ -1223,13 +1151,11 @@ function Explorer({
   loadingMore: boolean;
   itemFilter: BrowseKind;
   onFilterChange: (kind: BrowseKind) => void;
-  onDismissActivity: (id: string) => void;
 }) {
   const [folderOpen, setFolderOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Item>();
   const [deleteSelectionOpen, setDeleteSelectionOpen] = useState(false);
-  const uploadControllers = useRef(new Map<string, AbortController>());
   const visibleItems = items;
   const breadcrumbSegments = prefix
     .split("/")
@@ -1238,34 +1164,15 @@ function Explorer({
       name,
       prefix: `${segments.slice(0, index + 1).join("/")}/`,
     }));
-  const [zipPasswordOpen, setZipPasswordOpen] = useState(false);
-  async function cancelUpload(id: string) {
-    const controller = uploadControllers.current.get(id);
-    if (controller) {
-      controller.abort();
-      setActivities((current) => current.filter((item) => item.id !== id));
-      return;
-    }
-    const activity = activities.find((item) => item.id === id);
-    if (!activity?.uploadId) return;
-    try {
-      await api.abortUpload(activity.uploadId);
-      setActivities((current) => current.filter((item) => item.id !== id));
-    } catch (err) {
-      setActivities((current) => current.map((item) =>
-        item.id === id ? { ...item, state: "error", error: `Cancel failed: ${errorMessage(err)}` } : item,
-      ));
-    }
-  }
-  async function downloadArchive(format: "zip" | "tgz", password?: string) {
+  async function downloadArchive(format: "zip" | "tgz") {
     const id = `${Date.now()}-${format}`;
     const label = `${connection.bucket}${prefix ? `/${prefix}` : ""}.${format}`;
     setActivities((current) => [
       ...current,
-      { id, label, kind: "download", progress: 35, state: "active", connectionId: connection.id, prefix },
+      { id, label, kind: "download", progress: 35, state: "active" },
     ]);
     try {
-      const blob = await api.download(connection.id, prefix, format, password);
+      const blob = await api.download(connection.id, prefix, format);
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -1274,7 +1181,7 @@ function Explorer({
       URL.revokeObjectURL(url);
       setActivities((current) =>
         current.map((item) =>
-          item.id === id ? { ...item, progress: 100, state: "done", completedAt: Date.now() } : item,
+          item.id === id ? { ...item, progress: 100, state: "done" } : item,
         ),
       );
     } catch (err) {
@@ -1343,8 +1250,6 @@ function Explorer({
         kind: "delete" as const,
         progress: 0,
         state: "active" as const,
-        connectionId: connection.id,
-        prefix,
       })),
     ]);
     await Promise.all(
@@ -1354,7 +1259,7 @@ function Explorer({
           setActivities((current) =>
             current.map((activity) =>
               activity.id === id
-                ? { ...activity, progress: 100, state: "done", completedAt: Date.now() }
+                ? { ...activity, progress: 100, state: "done" }
                 : activity,
             ),
           );
@@ -1373,84 +1278,38 @@ function Explorer({
     await onRefresh();
   }
 
-  async function uploadFiles(
-    files: FileList | File[],
-    uploadConnection = connection,
-    uploadPrefix = prefix,
-  ) {
-    if (!uploadConnection) return;
-    const resumable = new Map(
-      activities
-        .filter(
-          (activity) =>
-            activity.kind === "upload" &&
-            (activity.state === "paused" || activity.state === "error") &&
-            activity.uploadId,
-        )
-        .map((activity) => [
-        `${activity.connectionId}\0${activity.prefix}\0${activity.fileName}\0${activity.fileSize}\0${activity.lastModified}`,
-          activity,
-        ]),
-    );
-    const pending = Array.from(files).map((file, index) => {
-      const match = resumable.get(
-        `${uploadConnection.id}\0${uploadPrefix}\0${file.name}\0${file.size}\0${file.lastModified}`,
-      );
-      return { file, id: match?.id ?? `${Date.now()}-${index}-${file.name}`, match };
-    });
+  async function uploadFiles(files: FileList | File[]) {
+    const pending = Array.from(files).map((file, index) => ({
+      file,
+      id: `${Date.now()}-${index}-${file.name}`,
+    }));
     if (!pending.length) return;
-    setActivities((current) => {
-      const next = pending.map(({ file, id, match }) => ({
-        ...(match || {}),
+    setActivities((current) => [
+      ...current,
+      ...pending.map(({ file, id }) => ({
         id,
         label: file.name,
         kind: "upload" as const,
-        progress: match?.progress || 0,
+        progress: 0,
         state: "active" as const,
-        error: undefined,
-        connectionId: uploadConnection.id,
-        prefix: uploadPrefix,
-        fileName: file.name,
-        fileSize: file.size,
-        lastModified: file.lastModified,
-      }));
-      const ids = new Set(next.map((item) => item.id));
-      return [...current.filter((item) => !ids.has(item.id)), ...next];
-    });
+      })),
+    ]);
     await Promise.all(
       pending.map(async ({ file, id }) => {
-        const match = pending.find((item) => item.id === id)?.match;
-        const controller = new AbortController();
-        uploadControllers.current.set(id, controller);
         try {
-          await api.upload(
-            uploadConnection.id,
-            uploadPrefix,
-            file,
-            (progress) =>
-              setActivities((current) =>
-                current.map((item) =>
-                  item.id === id ? { ...item, progress } : item,
-                ),
+          await api.upload(connection.id, prefix, file, (progress) =>
+            setActivities((current) =>
+              current.map((item) =>
+                item.id === id ? { ...item, progress } : item,
               ),
-            (uploadId, uploadKey) =>
-              setActivities((current) =>
-                current.map((item) =>
-                  item.id === id ? { ...item, uploadId, uploadKey } : item,
-                ),
-              ),
-            match?.uploadId && match.uploadKey
-              ? { uploadId: match.uploadId, key: match.uploadKey }
-              : undefined,
-            controller.signal,
+            ),
           );
           setActivities((current) =>
             current.map((item) =>
-              item.id === id ? { ...item, progress: 100, state: "done", completedAt: Date.now() } : item,
+              item.id === id ? { ...item, progress: 100, state: "done" } : item,
             ),
           );
         } catch (err) {
-          if (err instanceof DOMException && err.name === "AbortError") return;
           setActivities((current) =>
             current.map((item) =>
               item.id === id
@@ -1458,14 +1317,10 @@ function Explorer({
                 : item,
             ),
           );
-        } finally {
-          uploadControllers.current.delete(id);
         }
       }),
     );
-    if (uploadConnection.id === connection?.id && uploadPrefix === prefix) {
-      await onRefresh();
-    }
+    await onRefresh();
   }
 
   async function upload(event: React.ChangeEvent<HTMLInputElement>) {
@@ -1511,10 +1366,7 @@ function Explorer({
         <button className="secondary" onClick={() => setFolderOpen(true)}>
           <FolderPlus size={16} /> New folder
         </button>
-        <DownloadMenu
-          onDownload={downloadArchive}
-          onPasswordZip={() => setZipPasswordOpen(true)}
-        />
+        <DownloadMenu onDownload={downloadArchive} />
         <button
           className="secondary"
           onClick={
@@ -1630,8 +1482,6 @@ function Explorer({
                 kind: "delete",
                 progress: 0,
                 state: "active",
-                connectionId: connection.id,
-                prefix,
               },
             ]);
             try {
@@ -1639,7 +1489,7 @@ function Explorer({
               setActivities((current) =>
                 current.map((item) =>
                   item.id === id
-                    ? { ...item, progress: 100, state: "done", completedAt: Date.now() }
+                    ? { ...item, progress: 100, state: "done" }
                     : item,
                 ),
               );
@@ -1666,122 +1516,14 @@ function Explorer({
           }}
         />
       )}
-      {zipPasswordOpen && (
-        <ZipPasswordModal
-          onCancel={() => setZipPasswordOpen(false)}
-          onSubmit={async (password) => {
-            await downloadArchive("zip", password);
-            setZipPasswordOpen(false);
-          }}
-        />
-      )}
-      <ActivityTray
-        activities={activities}
-        connections={connections}
-        onDismiss={onDismissActivity}
-        onCancel={cancelUpload}
-        onResume={(activity, file) => {
-          if (
-            activity.fileName !== file.name ||
-            activity.fileSize !== file.size ||
-            activity.lastModified !== file.lastModified
-          ) {
-            setActivities((current) =>
-              current.map((item) =>
-                item.id === activity.id
-                  ? { ...item, state: "paused", error: "Choose the original file to resume this upload." }
-                  : item,
-              ),
-            );
-            return;
-          }
-          const target = connections.find((item) => item.id === activity.connectionId);
-          if (!target) {
-            setActivities((current) =>
-              current.map((item) =>
-                item.id === activity.id
-                  ? { ...item, state: "error", error: "The original connection is no longer available." }
-                  : item,
-              ),
-            );
-            return;
-          }
-          void uploadFiles([file], target, activity.prefix || "");
-        }}
-      />
     </section>
-  );
-}
-
-function ZipPasswordModal({
-  onCancel,
-  onSubmit,
-}: {
-  onCancel: () => void;
-  onSubmit: (password: string) => Promise<void>;
-}) {
-  const [password, setPassword] = useState("");
-  const [confirmation, setConfirmation] = useState("");
-  const [visible, setVisible] = useState(false);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    if (password.length < 10) {
-      setError("Use at least 10 characters.");
-      return;
-    }
-    if (password !== confirmation) {
-      setError("The ZIP passwords do not match.");
-      return;
-    }
-    setError("");
-    setLoading(true);
-    try {
-      await onSubmit(password);
-    } catch (err) {
-      setError(errorMessage(err));
-      setLoading(false);
-    }
-  }
-  return (
-    <div className="modal-backdrop">
-      <form className="card unlock" onSubmit={submit}>
-        <button type="button" className="modal-close unlock-close" aria-label="Close ZIP password dialog" onClick={onCancel} disabled={loading}>
-          <X size={20} />
-        </button>
-        <span className="eyebrow">PROTECTED DOWNLOAD</span>
-        <h2>Create encrypted ZIP</h2>
-        <p>Choose a password for this archive. The ZIP uses WinZip AES-256 encryption.</p>
-        <label className="unlock-label">
-          ZIP password
-          <div className="password-field">
-            <input autoFocus disabled={loading} type={visible ? "text" : "password"} value={password} onChange={(event) => { setPassword(event.target.value); setError(""); }} minLength={10} required />
-            <button type="button" className="icon password-toggle" aria-label={visible ? "Hide password" : "Show password"} onClick={() => setVisible((value) => !value)}>
-              {visible ? <EyeOff size={18} /> : <Eye size={18} />}
-            </button>
-          </div>
-        </label>
-        <label className="unlock-label">
-          Retype ZIP password
-          <input disabled={loading} type={visible ? "text" : "password"} value={confirmation} onChange={(event) => { setConfirmation(event.target.value); setError(""); }} minLength={10} required />
-        </label>
-        {error && <p className="form-error">{error}</p>}
-        <div className="modal-actions">
-          <button type="button" className="secondary" onClick={onCancel} disabled={loading}>Cancel</button>
-          <button className="button" type="submit" disabled={loading}>{loading && <LoaderCircle className="spin" size={16} />} Create protected ZIP</button>
-        </div>
-      </form>
-    </div>
   );
 }
 
 function DownloadMenu({
   onDownload,
-  onPasswordZip,
 }: {
   onDownload: (format: "zip" | "tgz") => void;
-  onPasswordZip: () => void;
 }) {
   const [open, setOpen] = useState(false);
   function choose(format: "zip" | "tgz") {
@@ -1808,9 +1550,6 @@ function DownloadMenu({
           </button>
           <button type="button" role="menuitem" onClick={() => choose("tgz")}>
             Download TGZ
-          </button>
-          <button type="button" role="menuitem" onClick={() => { setOpen(false); onPasswordZip(); }}>
-            Download protected ZIP
           </button>
         </div>
       )}
@@ -1978,20 +1717,12 @@ function DeleteConnectionModal({
 
 function ActivityTray({
   activities,
-  connections,
   onDismiss,
-  onCancel,
-  onResume,
 }: {
   activities: Activity[];
-  connections: Connection[];
   onDismiss: (id: string) => void;
-  onCancel: (id: string) => void;
-  onResume: (activity: Activity, file: File) => void;
 }) {
   const [minimized, setMinimized] = useState(false);
-  const [resumeId, setResumeId] = useState<string>();
-  const resumeInput = useRef<HTMLInputElement>(null);
   if (!activities.length) return null;
   return (
     <div className={`activity-tray ${minimized ? "minimized" : ""}`}>
@@ -2014,36 +1745,15 @@ function ActivityTray({
                       : "Downloading"}{" "}
                   {activity.label}
                 </span>
-                {activity.state === "active" && activity.kind === "upload" && (
-                  <button
-                    className="activity-cancel"
-                    onClick={() => onCancel(activity.id)}
-                    aria-label={`Cancel upload of ${activity.label}`}
-                  >
-                    Cancel
-                  </button>
-                )}
                 {activity.state !== "active" && (
                   <button
                     className="activity-dismiss"
                     onClick={() => onDismiss(activity.id)}
-                    aria-label={`Dismiss ${activity.label}`}
                   >
                     ×
                   </button>
                 )}
               </div>
-              {activity.connectionId && (
-                <div className="activity-context">
-                  {(() => {
-                    const taskConnection = connections.find((item) => item.id === activity.connectionId);
-                    return taskConnection
-                      ? `${taskConnection.name} / ${taskConnection.bucket}`
-                      : "Connection unavailable";
-                  })()}
-                  {activity.prefix ? ` / ${activity.prefix}` : ""}
-                </div>
-              )}
               <div className="activity-progress">
                 <span
                   className={`${activity.state} ${activity.kind !== "upload" && activity.state === "active" ? "indeterminate" : ""}`}
@@ -2057,58 +1767,18 @@ function ActivityTray({
                   ) : (
                     "Working…"
                   )
-                ) : activity.state === "paused" ? (
-                  <>
-                    <span>{activity.error || "Upload paused."}</span>
-                    {activity.kind === "upload" && activity.uploadId && (
-                      <button
-                        className="activity-action"
-                        onClick={() => {
-                          setResumeId(activity.id);
-                          resumeInput.current?.click();
-                        }}
-                      >
-                        Choose file to resume
-                      </button>
-                    )}
-                  </>
                 ) : activity.state === "done" ? (
                   <>
                     <Check size={13} /> Complete
                   </>
                 ) : (
-                  <>
-                    <span>{activity.error || "Upload failed."}</span>
-                    {activity.kind === "upload" && activity.uploadId && (
-                      <button
-                        className="activity-action"
-                        onClick={() => {
-                          setResumeId(activity.id);
-                          resumeInput.current?.click();
-                        }}
-                      >
-                        Resume upload
-                      </button>
-                    )}
-                  </>
+                  activity.error || "Failed"
                 )}
               </small>
             </div>
           ))}
         </div>
       )}
-      <input
-        ref={resumeInput}
-        className="visually-hidden"
-        type="file"
-        onChange={(event) => {
-          const activity = activities.find((item) => item.id === resumeId);
-          const file = event.target.files?.[0];
-          if (activity && file) onResume(activity, file);
-          event.target.value = "";
-          setResumeId(undefined);
-        }}
-      />
     </div>
   );
 }

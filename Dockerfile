@@ -6,7 +6,6 @@ WORKDIR /src/frontend
 COPY frontend/package.json frontend/package-lock.json frontend/tsconfig.json frontend/vite.config.ts frontend/index.html ./
 RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 COPY frontend/src ./src
-COPY frontend/public ./public
 RUN npm run build
 
 FROM --platform=${BUILDPLATFORM} golang:1.27.1 AS build

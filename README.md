@@ -22,7 +22,7 @@ The OIDC client defaults to requesting the `openid`, `profile`, and `email` scop
 
 ### Database and audit storage
 
-PostgreSQL is the default storage backend in the Helm chart. Set `database.driver: sqlite` for lightweight single-replica deployments. PostgreSQL requires either `DATABASE_URL` or the chart's field-based Secret selectors. Both schemas store the same encrypted vault envelope, so the master password is never stored by Mariner. The Helm chart supports `database.driver`, `database.url`, and `database.existingSecret`. Set `sessionIdleTimeout` to a Go duration such as `30m` to control how long an unlocked vault may remain idle; the default is 30 minutes.
+PostgreSQL is the default storage backend in the Helm chart. Set `database.driver: sqlite` for lightweight single-replica deployments. PostgreSQL requires either `DATABASE_URL` or the chart's field-based Secret selectors. Both schemas store the same encrypted vault envelope, so the master password is never stored by Mariner. The Helm chart supports `database.driver`, `database.url`, and `database.existingSecret`.
 
 The application Helm chart does not deploy a PostgreSQL server; it consumes an external PostgreSQL endpoint or Secret. The local Kustomize environment deploys separate PostgreSQL instances for Keycloak in `infra` and Mariner in `mariner`.
 
@@ -44,50 +44,61 @@ database:
 
 Alternatively, set `existingSecret.urlKey` to use one Secret field containing a complete PostgreSQL URL.
 
-Every audit event is serialized once as canonical JSON and stored byte-for-byte in the selected database's `audit_events.event_json` column. With PostgreSQL, the optional single-replica audit-forwarder Deployment polls that table and writes each new `event_json` value unchanged to stdout for Alloy/Loki. With SQLite, the same forwarder runs as a Mariner sidecar so the RWO application PVC remains local to one pod and node. This keeps SQLite and PostgreSQL audit content identical without requiring a shared audit-log file or RWX volume.
+Every audit event is serialized once as canonical JSON and stored byte-for-byte in the selected database's `audit_events.event_json` column. The optional audit sidecar polls that table and writes each new `event_json` value unchanged to stdout for Alloy/Loki. This keeps SQLite and PostgreSQL audit content identical without requiring a shared audit-log file or PVC.
 
-The chart's audit forwarder polls the configured database and forwards new audit rows to stdout for Alloy/Loki. PostgreSQL provisions it as a standalone Deployment; SQLite provisions it as a Mariner sidecar:
+The chart sidecar polls the configured database and forwards new audit rows to stdout for Alloy/Loki:
 
 ```yaml
 audit:
   enabled: true
-  forwarder:
+  sidecar:
     enabled: true
     image: ""
 ```
 
-The forwarder is enabled by default. It runs as one standalone replica with
-PostgreSQL and as one sidecar per Mariner pod with SQLite. It starts at the latest audit
+The sidecar is enabled by default in the chart. It starts at the latest audit
 row and emits only newly committed rows, so a restart does not replay history.
-Set `audit.forwarder.enabled: false` when another collector reads the database.
-The forwarder supports custom `image`, `command`, `args`, `env`, and `envFrom`
-values for integrations with an external log collector:
+Set `audit.sidecar.enabled: false` when another collector reads the database.
+The sidecar is vendor-neutral and supports custom `image`, `command`, `args`,
+`env`, and `envFrom` values. This allows a custom Splunk HEC shipper image to
+poll or forward events directly:
 
 ```yaml
 audit:
-  forwarder:
-    image: registry.example.com/audit-forwarder:1.0.0
-    command: ["/bin/audit-forwarder"]
+  sidecar:
+    image: registry.example.com/audit-to-splunk:1.0.0
+    command: ["/bin/audit-to-splunk"]
     args: ["--database"]
+    env:
+      - name: SPLUNK_HEC_URL
+        valueFrom:
+          secretKeyRef:
+            name: splunk-hec
+            key: url
+    envFrom:
+      - secretRef:
+          name: splunk-hec
 ```
 
-The chart also supports standard pod volume hooks for custom forwarder or
+Keep HEC URLs and tokens in Secret references; do not put them in Helm values.
+
+The chart also supports standard pod volume hooks for custom sidecar or
 application configuration:
 
 ```yaml
 extraVolumes:
-  - name: audit-ca
+  - name: splunk-ca
     secret:
-      secretName: audit-ca
+      secretName: splunk-ca
 extraVolumeMounts:
-  - name: audit-ca
-    mountPath: /etc/audit-ca
+  - name: splunk-ca
+    mountPath: /etc/splunk-ca
     readOnly: true
 ```
 
 `extraVolumes` is pod-scoped and is available to all containers. `extraVolumeMounts`
-and `audit.forwarder.extraVolumeMounts` add mounts to the Mariner container and audit
-forwarder respectively. CA files configured through `caBundle.secretName` or
+and `audit.sidecar.extraVolumeMounts` add mounts to the Mariner container and audit
+sidecar respectively. CA files configured through `caBundle.secretName` or
 `caBundle.configMapName` are mounted directly into Mariner and combined with the
 platform trust pool by the application. The chart keeps its containers under the
 restricted security context; custom volume types and mount settings must also
@@ -136,11 +147,7 @@ oidc:
     cookieSecretKey: COOKIE_SECRET
 ```
 
-An empty object or an empty `name` makes the chart create its release Secret and use `oidc.clientId`/`oidc.clientSecret`. PostgreSQL-backed deployments persist HTTP sessions and multipart-upload metadata in the database and may run multiple Mariner replicas. Keep `replicaCount: 1` while using SQLite and a `ReadWriteOnce` volume; SQLite is not a shared multi-replica database in this deployment model.
-
-Stale multipart uploads are cleaned up by the Mariner background worker. Configure `multipartCleanup.enabled`, `multipartCleanup.interval` (default `15m`), and `multipartCleanup.maxAge` (default `12h`). The worker aborts the S3 upload before deleting its SQL metadata; failed cleanup remains eligible for a later retry.
-
-When using SQLite, set `persistence.enabled: true`; the sidecar mounts the same PVC as Mariner and remains in the same pod. SQLite also forces the Mariner Deployment to use the `Recreate` strategy during upgrades, preventing overlapping application pods. PostgreSQL uses `RollingUpdate` and does not require the application PVC.
+An empty object or an empty `name` makes the chart create its release Secret and use `oidc.clientId`/`oidc.clientSecret`. Keep `replicaCount: 1` while using SQLite and a `ReadWriteOnce` volume.
 
 OIDC logout is enabled by default. Mariner clears its local session and then redirects through the provider's discovered `end_session_endpoint`; set `oidc.logout.enabled: false` to perform local-only logout.
 

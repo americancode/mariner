@@ -6,10 +6,6 @@ metadata:
     {{- include "mariner.labels" . | nindent 4 }}
 data:
   DATABASE_DRIVER: {{ default "postgres" .Values.database.driver | quote }}
-  SESSION_IDLE_TIMEOUT: {{ default "30m" .Values.sessionIdleTimeout | quote }}
-  MULTIPART_CLEANUP_INTERVAL: {{ default "15m" .Values.multipartCleanup.interval | quote }}
-  MULTIPART_CLEANUP_MAX_AGE: {{ default "12h" .Values.multipartCleanup.maxAge | quote }}
-  MULTIPART_CLEANUP_ENABLED: {{ default true .Values.multipartCleanup.enabled | quote }}
   AUDIT_ENABLED: {{ default true .Values.audit.enabled | quote }}
   AUDIT_ADMIN_GROUP: {{ default (default "admins" .Values.audit.adminGroup) .Values.oidc.adminGroup | quote }}
   OIDC_ISSUER: {{ required "oidc.issuer is required" .Values.oidc.issuer | quote }}

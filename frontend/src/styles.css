@@ -662,14 +662,6 @@ html[data-theme="dark"] .modal-warning strong {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.activity-context {
-  color: var(--muted);
-  font-size: 11px;
-  margin-top: 4px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .activity-progress {
   background: #e7eee8;
   border-radius: 99px;
@@ -695,41 +687,7 @@ html[data-theme="dark"] .modal-warning strong {
   align-items: center;
   color: var(--muted);
   display: flex;
-  flex-wrap: wrap;
   gap: 4px;
-}
-.activity-action {
-  background: transparent;
-  border: 0;
-  color: var(--green);
-  cursor: pointer;
-  font: inherit;
-  font-weight: 700;
-  padding: 0;
-  text-decoration: underline;
-}
-.activity-cancel {
-  background: transparent;
-  border: 0;
-  color: #a94e40;
-  cursor: pointer;
-  flex: 0 0 auto;
-  font: inherit;
-  font-size: 11px;
-  font-weight: 700;
-  padding: 2px 0;
-}
-.activity-cancel:hover,
-.activity-cancel:focus-visible {
-  text-decoration: underline;
-}
-.visually-hidden {
-  height: 1px;
-  margin: -1px;
-  opacity: 0;
-  overflow: hidden;
-  position: absolute;
-  width: 1px;
 }
 .activity-dismiss {
   background: transparent;

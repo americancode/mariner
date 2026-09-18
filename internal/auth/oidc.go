@@ -2,14 +2,11 @@ package auth
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,12 +32,6 @@ type Session struct {
 	Password string
 	Expires  time.Time
 }
-type SessionStore interface {
-	SaveSession(id, userID, userName, groupsJSON, passwordCiphertext string, expiresAt time.Time) error
-	LoadSession(id string) (userID, userName, groupsJSON, passwordCiphertext string, expiresAt, lastSeenAt time.Time, found bool, err error)
-	DeleteSession(id string) error
-	TouchSessionIfStale(id string, at, before time.Time) error
-}
 type Service struct {
 	Provider                *oidc.Provider
 	OAuth                   *oauth2.Config
@@ -51,19 +42,9 @@ type Service struct {
 	DebugJWT                bool
 	LogoutEnabled           bool
 	LogoutEndpoint          string
-	SessionIdleTimeout      time.Duration
-	sessionStore            SessionStore
-	sessions                map[string]Session // retained only for tests/standalone use
+	sessions                map[string]Session
 	mu                      sync.RWMutex
-	touchMu                 sync.Mutex
-	lastTouches             map[string]time.Time
 }
-
-const sessionTouchInterval = 30 * time.Second
-
-func (s *Service) SetSessionStore(store SessionStore) { s.sessionStore = store }
-
-func (s *Service) SetSessionIdleTimeout(timeout time.Duration) { s.SessionIdleTimeout = timeout }
 
 func New(issuer, clientID, clientSecret, redirect, cookieSecret, groupsClaim, audienceClaim, audience, nameClaim string, scopes []string, debugJWT, logoutEnabled bool) (*Service, error) {
 	if len(scopes) == 0 {
@@ -83,7 +64,7 @@ func New(issuer, clientID, clientSecret, redirect, cookieSecret, groupsClaim, au
 	if err != nil {
 		return nil, fmt.Errorf("OIDC discovery request failed: %w", err)
 	}
-	return &Service{Provider: provider, OAuth: &oauth2.Config{ClientID: clientID, ClientSecret: clientSecret, Endpoint: provider.Endpoint(), RedirectURL: redirect, Scopes: scopes}, CookieSecret: cookieSecret, GroupsClaim: groupsClaim, AudienceClaim: audienceClaim, Audience: audience, NameClaim: nameClaim, DebugJWT: debugJWT, LogoutEnabled: logoutEnabled, LogoutEndpoint: logoutEndpoint, sessions: map[string]Session{}, lastTouches: map[string]time.Time{}}, nil
+	return &Service{Provider: provider, OAuth: &oauth2.Config{ClientID: clientID, ClientSecret: clientSecret, Endpoint: provider.Endpoint(), RedirectURL: redirect, Scopes: scopes}, CookieSecret: cookieSecret, GroupsClaim: groupsClaim, AudienceClaim: audienceClaim, Audience: audience, NameClaim: nameClaim, DebugJWT: debugJWT, LogoutEnabled: logoutEnabled, LogoutEndpoint: logoutEndpoint, sessions: map[string]Session{}}, nil
 }
 
 func discoverLogoutEndpoint(client *http.Client, issuer string) (string, error) {
@@ -110,9 +91,7 @@ func discoverLogoutEndpoint(client *http.Client, issuer string) (string, error) 
 }
 func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
 	state := random(18)
-	returnTo := safeReturnPath(r.URL.Query().Get("return"))
 	s.setCookie(w, "mariner_state", state, 600)
-	s.setCookie(w, "mariner_return", returnTo, 600)
 	http.Redirect(w, r, s.OAuth.AuthCodeURL(state), http.StatusFound)
 }
 func (s *Service) Callback(r *http.Request) (User, string, error) {
@@ -128,7 +107,7 @@ func (s *Service) Callback(r *http.Request) (User, string, error) {
 		return User{}, "", errors.New("OIDC provider did not return an ID token")
 	}
 	if s.DebugJWT {
-		log.Printf("oidc: received ID token for validation")
+		log.Printf("oidc: received id_token=%s", raw)
 	}
 	verifyConfig := &oidc.Config{ClientID: s.OAuth.ClientID}
 	if s.AudienceClaim != "aud" {
@@ -144,7 +123,7 @@ func (s *Service) Callback(r *http.Request) (User, string, error) {
 		return User{}, "", errors.New("identity token has no subject")
 	}
 	if s.DebugJWT {
-		log.Printf("oidc: ID token claims validated")
+		log.Printf("oidc: validated claims=%s", string(mustJSON(claims)))
 	}
 	if s.AudienceClaim != "aud" && !contains(claimGroups(claims, s.AudienceClaim), s.Audience) {
 		log.Printf("oidc: audience mismatch claim=%q expected=%q", s.AudienceClaim, s.Audience)
@@ -170,6 +149,7 @@ func (s *Service) Callback(r *http.Request) (User, string, error) {
 	}
 	return User{ID: sub, Name: name, Groups: claimGroups(claims, s.GroupsClaim)}, random(24), nil
 }
+func mustJSON(value any) []byte { encoded, _ := json.Marshal(value); return encoded }
 func contains(values []string, expected string) bool {
 	for _, value := range values {
 		if value == expected {
@@ -193,114 +173,32 @@ func claimGroups(claims map[string]json.RawMessage, key string) []string {
 	}
 	return nil
 }
-func (s *Service) StartSession(w http.ResponseWriter, id string, user User) error {
-	expires := time.Now().Add(12 * time.Hour)
-	if s.sessionStore != nil {
-		if err := s.sessionStore.SaveSession(id, user.ID, user.Name, marshalGroups(user.Groups), "", expires); err != nil {
-			return err
-		}
-	} else {
-		s.mu.Lock()
-		s.sessions[id] = Session{User: user, Expires: expires}
-		s.mu.Unlock()
-	}
+func (s *Service) StartSession(w http.ResponseWriter, id string, user User) {
+	s.mu.Lock()
+	s.sessions[id] = Session{User: user, Expires: time.Now().Add(12 * time.Hour)}
+	s.mu.Unlock()
 	s.setCookie(w, "mariner_session", id, 43200)
-	return nil
 }
 func (s *Service) Current(r *http.Request) (Session, string, bool) {
 	id := s.cookie(r, "mariner_session")
-	if s.sessionStore != nil {
-		userID, userName, groupsJSON, encryptedPassword, expires, lastSeen, found, err := s.sessionStore.LoadSession(id)
-		now := time.Now()
-		if err != nil {
-			log.Printf("auth session load failed session_ref=%s error=%v", sessionRef(id), err)
-		}
-		if err != nil || !found || now.After(expires) || (s.SessionIdleTimeout > 0 && now.Sub(lastSeen) > s.SessionIdleTimeout) {
-			if found && (now.After(expires) || (s.SessionIdleTimeout > 0 && now.Sub(lastSeen) > s.SessionIdleTimeout)) {
-				log.Printf("auth session expired session_ref=%s reason=%s", sessionRef(id), sessionExpiryReason(now, expires, lastSeen, s.SessionIdleTimeout))
-				_ = s.sessionStore.DeleteSession(id)
-			}
-			s.touchMu.Lock()
-			delete(s.lastTouches, id)
-			s.touchMu.Unlock()
-			return Session{}, id, false
-		}
-		// A fresh session is read-only. This local gate prevents a burst of
-		// concurrent requests from each attempting the same conditional SQL
-		// update after the shared timestamp becomes stale.
-		if now.Sub(lastSeen) >= sessionTouchInterval {
-			s.touchMu.Lock()
-			lastTouch := s.lastTouches[id]
-			if now.Sub(lastTouch) >= sessionTouchInterval {
-				s.lastTouches[id] = now
-				err = s.sessionStore.TouchSessionIfStale(id, now, now.Add(-sessionTouchInterval))
-				if err != nil {
-					delete(s.lastTouches, id)
-				}
-			}
-			s.touchMu.Unlock()
-			if err != nil {
-				log.Printf("auth session touch failed session_ref=%s error=%v", sessionRef(id), err)
-			}
-		}
-		groups := []string{}
-		if json.Unmarshal([]byte(groupsJSON), &groups) != nil {
-			return Session{}, id, false
-		}
-		password, err := decryptSessionSecret(encryptedPassword, s.CookieSecret)
-		if err != nil {
-			return Session{}, id, false
-		}
-		return Session{User: User{ID: userID, Name: userName, Groups: groups}, Password: password, Expires: expires}, id, true
-	}
 	s.mu.RLock()
 	session, ok := s.sessions[id]
 	s.mu.RUnlock()
 	return session, id, ok && time.Now().Before(session.Expires)
 }
-
-func sessionRef(id string) string {
-	sum := sha256.Sum256([]byte(id))
-	return hex.EncodeToString(sum[:4])
-}
-
-func sessionExpiryReason(now, expires, lastSeen time.Time, idleTimeout time.Duration) string {
-	if now.After(expires) {
-		return "absolute_timeout"
-	}
-	if idleTimeout > 0 && now.Sub(lastSeen) > idleTimeout {
-		return "idle_timeout"
-	}
-	return "invalid"
-}
-func (s *Service) SetPassword(id, password string) error {
-	if s.sessionStore != nil {
-		session, _, ok := s.CurrentCookie(id)
-		if !ok {
-			return errors.New("session not found")
-		}
-		return s.sessionStore.SaveSession(id, session.User.ID, session.User.Name, marshalGroups(session.User.Groups), encryptSessionSecret(password, s.CookieSecret), session.Expires)
-	}
+func (s *Service) SetPassword(id, password string) {
 	s.mu.Lock()
 	session := s.sessions[id]
 	session.Password = password
 	s.sessions[id] = session
 	s.mu.Unlock()
-	return nil
 }
-func (s *Service) Lock(id string) error { return s.SetPassword(id, "") }
+func (s *Service) Lock(id string) { s.SetPassword(id, "") }
 func (s *Service) Logout(w http.ResponseWriter, r *http.Request) {
 	id := s.cookie(r, "mariner_session")
-	if s.sessionStore != nil {
-		_ = s.sessionStore.DeleteSession(id)
-		s.touchMu.Lock()
-		delete(s.lastTouches, id)
-		s.touchMu.Unlock()
-	} else {
-		s.mu.Lock()
-		delete(s.sessions, id)
-		s.mu.Unlock()
-	}
+	s.mu.Lock()
+	delete(s.sessions, id)
+	s.mu.Unlock()
 	s.setCookie(w, "mariner_session", "", -1)
 	if s.LogoutEnabled && s.LogoutEndpoint != "" {
 		logoutURL, err := url.Parse(s.LogoutEndpoint)
@@ -315,98 +213,11 @@ func (s *Service) Logout(w http.ResponseWriter, r *http.Request) {
 	}
 	http.Redirect(w, r, "/", http.StatusFound)
 }
-
-func (s *Service) CurrentCookie(id string) (Session, string, bool) {
-	if s.sessionStore == nil {
-		s.mu.RLock()
-		session, ok := s.sessions[id]
-		s.mu.RUnlock()
-		return session, id, ok && time.Now().Before(session.Expires)
-	}
-	userID, userName, groupsJSON, encryptedPassword, expires, lastSeen, found, err := s.sessionStore.LoadSession(id)
-	now := time.Now()
-	if err != nil || !found || now.After(expires) || (s.SessionIdleTimeout > 0 && now.Sub(lastSeen) > s.SessionIdleTimeout) {
-		return Session{}, id, false
-	}
-	var groups []string
-	if json.Unmarshal([]byte(groupsJSON), &groups) != nil {
-		return Session{}, id, false
-	}
-	password, err := decryptSessionSecret(encryptedPassword, s.CookieSecret)
-	if err != nil {
-		return Session{}, id, false
-	}
-	return Session{User: User{ID: userID, Name: userName, Groups: groups}, Password: password, Expires: expires}, id, true
-}
-
-func marshalGroups(groups []string) string { raw, _ := json.Marshal(groups); return string(raw) }
-
-func sessionCipher(secret string) (cipher.AEAD, error) {
-	sum := sha256.Sum256([]byte("mariner-session-encryption:" + secret))
-	block, err := aes.NewCipher(sum[:])
-	if err != nil {
-		return nil, err
-	}
-	return cipher.NewGCM(block)
-}
-func encryptSessionSecret(value, secret string) string {
-	if value == "" {
-		return ""
-	}
-	gcm, err := sessionCipher(secret)
-	if err != nil {
-		return ""
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err = rand.Read(nonce); err != nil {
-		return ""
-	}
-	return base64.RawStdEncoding.EncodeToString(append(nonce, gcm.Seal(nil, nonce, []byte(value), nil)...))
-}
-func decryptSessionSecret(encoded, secret string) (string, error) {
-	if encoded == "" {
-		return "", nil
-	}
-	payload, err := base64.RawStdEncoding.DecodeString(encoded)
-	if err != nil {
-		return "", err
-	}
-	gcm, err := sessionCipher(secret)
-	if err != nil || len(payload) < gcm.NonceSize() {
-		return "", errors.New("invalid session secret")
-	}
-	raw, err := gcm.Open(nil, payload[:gcm.NonceSize()], payload[gcm.NonceSize():], nil)
-	return string(raw), err
-}
-
-// EncryptForStorage protects short-lived server-side secrets stored in SQL.
-func EncryptForStorage(value, secret string) string { return encryptSessionSecret(value, secret) }
-
-// DecryptForStorage decrypts short-lived server-side secrets stored in SQL.
-func DecryptForStorage(encoded, secret string) (string, error) {
-	return decryptSessionSecret(encoded, secret)
-}
 func (s *Service) setCookie(w http.ResponseWriter, name, value string, age int) {
 	mac := hmac.New(sha256.New, []byte(s.CookieSecret))
 	mac.Write([]byte(value))
 	signed := value + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	http.SetCookie(w, &http.Cookie{Name: name, Value: signed, Path: "/", MaxAge: age, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
-}
-func (s *Service) ReturnPath(r *http.Request) string {
-	return safeReturnPath(s.cookie(r, "mariner_return"))
-}
-func (s *Service) ClearReturnPath(w http.ResponseWriter) {
-	s.setCookie(w, "mariner_return", "", -1)
-}
-func safeReturnPath(value string) string {
-	if value == "" {
-		return "/"
-	}
-	parsed, err := url.Parse(value)
-	if err != nil || strings.ContainsAny(value, "\r\n\\") || parsed.IsAbs() || parsed.Host != "" || !strings.HasPrefix(parsed.Path, "/") || strings.HasPrefix(parsed.Path, "//") {
-		return "/"
-	}
-	return parsed.RequestURI()
 }
 func (s *Service) cookie(r *http.Request, name string) string {
 	c, err := r.Cookie(name)

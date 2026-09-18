@@ -9,7 +9,7 @@ import (
 )
 
 // Logger writes the canonical JSON event to the database. Delivery to stdout
-// is handled independently by the database-polling forwarder.
+// is handled independently by the database-polling sidecar.
 type Logger struct {
 	store *vault.Store
 	mu    sync.Mutex
