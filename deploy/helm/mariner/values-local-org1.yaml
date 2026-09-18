@@ -6,6 +6,10 @@ image:
   tag: local
   pullPolicy: Never
 
+# Local kind testing intentionally leaves CPU and memory unconstrained.
+# Chart defaults remain bounded for normal deployments.
+resources: null
+
 persistence:
   enabled: false
 

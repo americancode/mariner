@@ -19,7 +19,21 @@ export type BrowseResponse = {
   nextToken?: string;
   hasMore: boolean;
 };
-export type BrowseKind = "all" | "file" | "folder";
+export type BrowseKind = "all" | "file" | "folder" | "multipart";
+export type MultipartUpload = {
+  uploadId: string;
+  key: string;
+  initiated: string;
+};
+export type ObjectVersion = {
+  versionId: string;
+  key: string;
+  isLatest: boolean;
+  lastModified: string;
+  size: number;
+  etag?: string;
+  deleteMarker: boolean;
+};
 export type Settings = { theme?: "light" | "dark" };
 export type AuditEvent = {
   event_id: string;
@@ -123,6 +137,28 @@ export const api = {
     request<BrowseResponse>(
       `/api/browse?connection=${id}&prefix=${encodeURIComponent(prefix)}&kind=${kind}${nextToken ? `&continuationToken=${encodeURIComponent(nextToken)}` : ""}`,
     ),
+  search: (id: string, prefix: string, query: string, kind: BrowseKind = "all") =>
+    request<BrowseResponse>(
+      `/api/search?connection=${id}&prefix=${encodeURIComponent(prefix)}&query=${encodeURIComponent(query)}&kind=${kind}`,
+    ),
+  multipartUploads: (id: string, prefix = "") =>
+    request<{ uploads: MultipartUpload[] }>(
+      `/api/multipart?connection=${encodeURIComponent(id)}&prefix=${encodeURIComponent(prefix)}`,
+    ),
+  abortMultipart: (id: string, upload: MultipartUpload) =>
+    request<void>(
+      `/api/multipart?connection=${encodeURIComponent(id)}&uploadId=${encodeURIComponent(upload.uploadId)}&key=${encodeURIComponent(upload.key)}`,
+      { method: "DELETE" },
+    ),
+  versions: (id: string, key: string) =>
+    request<{ versions: ObjectVersion[] }>(
+      `/api/versions?connection=${encodeURIComponent(id)}&key=${encodeURIComponent(key)}`,
+    ),
+  deleteVersion: (id: string, version: ObjectVersion) =>
+    request<void>(
+      `/api/versions?connection=${encodeURIComponent(id)}&key=${encodeURIComponent(version.key)}&versionId=${encodeURIComponent(version.versionId)}`,
+      { method: "DELETE" },
+    ),
   connections: () => request<Connection[]>("/api/connections"),
   addConnection: (value: object) =>
     request<{ id: string }>("/api/connections", {
@@ -159,6 +195,8 @@ export const api = {
     request<void>(`/api/file?connection=${id}&key=${encodeURIComponent(key)}`, {
       method: "DELETE",
     }),
+  fileUrl: (id: string, key: string, versionId?: string) =>
+    `/api/file?connection=${encodeURIComponent(id)}&key=${encodeURIComponent(key)}${versionId ? `&versionId=${encodeURIComponent(versionId)}` : ""}`,
   download: (id: string, prefix: string, format: "zip" | "tgz") =>
     fetch(
       `/api/download?connection=${id}&prefix=${encodeURIComponent(prefix)}&format=${format}`,

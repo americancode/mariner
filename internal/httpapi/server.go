@@ -86,6 +86,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/auth/login", s.login)
 	r.Get("/auth/callback", s.callback)
 	r.Get("/auth/logout", s.logout)
+	r.Get("/api/healthz", s.healthz)
 	r.Get("/api/me", s.me)
 	r.Get("/api/admin/audit", s.adminAudit)
 	r.Get("/api/admin/audit/actions", s.adminAuditActions)
@@ -108,6 +109,11 @@ func (s *Server) Router() http.Handler {
 	r.Delete("/api/connections", s.deleteConnection)
 	r.Post("/api/folders", s.createFolder)
 	r.Get("/api/browse", s.browse)
+	r.Get("/api/search", s.search)
+	r.Get("/api/multipart", s.multipartUploads)
+	r.Delete("/api/multipart", s.multipartAbort)
+	r.Get("/api/versions", s.versions)
+	r.Delete("/api/versions", s.deleteVersion)
 	r.Get("/api/file", s.file)
 	r.Delete("/api/file", s.deleteFile)
 	r.Post("/api/upload", s.upload)
@@ -289,6 +295,7 @@ func (s *Server) deleteAdminOrganization(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := s.Vault.DeleteOrganization(id); err != nil {
+		log.Printf("admin organization database delete failed error=%v", err)
 		fail(w, 500, err)
 		return
 	}
@@ -360,6 +367,10 @@ func (s *Server) unlocked(r *http.Request) (auth.Session, string, vault.Data, er
 	data, _, err := s.Vault.Load(session.User.ID, session.Password)
 	return session, id, data, err
 }
+func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
+	write(w, map[string]string{"status": "ok"})
+}
+
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	session, _, ok := s.Auth.Current(r)
 	if !ok {
@@ -789,6 +800,286 @@ func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
 		"hasMore":    aws.ToBool(result.IsTruncated),
 	})
 }
+
+// search scans the current S3 prefix one level deep. The search is performed
+// by S3 rather than against the currently loaded browser page, so it also
+// finds matches beyond the normal ListObjectsV2 page boundary.
+func (s *Server) search(w http.ResponseWriter, r *http.Request) {
+	session, _, data, err := s.unlocked(r)
+	if err != nil {
+		fail(w, 423, err)
+		return
+	}
+	c, err := s.connection(r, data, session.User)
+	if err != nil {
+		fail(w, 404, err)
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("query"))
+	if query == "" {
+		fail(w, http.StatusBadRequest, fmt.Errorf("search query is required"))
+		return
+	}
+	kind := r.URL.Query().Get("kind")
+	if kind == "" {
+		kind = "all"
+	}
+	if kind != "all" && kind != "file" && kind != "folder" {
+		fail(w, http.StatusBadRequest, fmt.Errorf("invalid search kind %q", kind))
+		return
+	}
+	client, err := s3client.New(r.Context(), c)
+	if err != nil {
+		fail(w, 500, err)
+		return
+	}
+	prefix := r.URL.Query().Get("prefix")
+	if prefix == "" {
+		prefix = c.Prefix
+	}
+	needle := strings.ToLower(query)
+	input := &s3.ListObjectsV2Input{
+		Bucket:    aws.String(c.Bucket),
+		Prefix:    aws.String(prefix),
+		Delimiter: aws.String("/"),
+	}
+	items := make([]item, 0)
+	for {
+		result, listErr := client.ListObjectsV2(r.Context(), input)
+		if listErr != nil {
+			fail(w, 502, listErr)
+			return
+		}
+		if kind != "file" {
+			for _, p := range result.CommonPrefixes {
+				key := aws.ToString(p.Prefix)
+				name := strings.TrimSuffix(strings.TrimPrefix(key, prefix), "/")
+				if strings.Contains(strings.ToLower(name), needle) {
+					items = append(items, item{Name: name, Key: key, Kind: "folder"})
+				}
+			}
+		}
+		if kind != "folder" {
+			for _, object := range result.Contents {
+				key := aws.ToString(object.Key)
+				name := path.Base(key)
+				if key != prefix && strings.Contains(strings.ToLower(name), needle) {
+					items = append(items, item{Name: name, Key: key, Kind: "file", Size: aws.ToInt64(object.Size), Modified: object.LastModified})
+				}
+			}
+		}
+		if !aws.ToBool(result.IsTruncated) {
+			break
+		}
+		input.ContinuationToken = result.NextContinuationToken
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Kind > items[j].Kind || items[i].Name < items[j].Name })
+	write(w, map[string]any{
+		"connection": c.Name,
+		"prefix":     prefix,
+		"items":      items,
+		"hasMore":    false,
+	})
+}
+
+type multipartUploadInfo struct {
+	UploadID  string    `json:"uploadId"`
+	Key       string    `json:"key"`
+	Initiated time.Time `json:"initiated"`
+}
+
+type objectVersionInfo struct {
+	VersionID    string    `json:"versionId"`
+	Key          string    `json:"key"`
+	IsLatest     bool      `json:"isLatest"`
+	LastModified time.Time `json:"lastModified"`
+	Size         int64     `json:"size"`
+	ETag         string    `json:"etag,omitempty"`
+	DeleteMarker bool      `json:"deleteMarker"`
+}
+
+func (s *Server) versions(w http.ResponseWriter, r *http.Request) {
+	session, _, data, err := s.unlocked(r)
+	if err != nil {
+		fail(w, http.StatusLocked, err)
+		return
+	}
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		fail(w, http.StatusBadRequest, errors.New("object key is required"))
+		return
+	}
+	c, err := s.connection(r, data, session.User)
+	if err != nil {
+		fail(w, http.StatusNotFound, err)
+		return
+	}
+	client, err := s3client.New(r.Context(), c)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	input := &s3.ListObjectVersionsInput{Bucket: aws.String(c.Bucket), Prefix: aws.String(key)}
+	versions := make([]objectVersionInfo, 0)
+	for {
+		result, listErr := client.ListObjectVersions(r.Context(), input)
+		if listErr != nil {
+			fail(w, http.StatusBadGateway, listErr)
+			return
+		}
+		for _, version := range result.Versions {
+			if aws.ToString(version.Key) != key || version.VersionId == nil || version.LastModified == nil {
+				continue
+			}
+			versions = append(versions, objectVersionInfo{
+				VersionID:    aws.ToString(version.VersionId),
+				Key:          key,
+				IsLatest:     aws.ToBool(version.IsLatest),
+				LastModified: aws.ToTime(version.LastModified),
+				Size:         aws.ToInt64(version.Size),
+				ETag:         strings.Trim(aws.ToString(version.ETag), "\""),
+			})
+		}
+		for _, marker := range result.DeleteMarkers {
+			if aws.ToString(marker.Key) != key || marker.VersionId == nil || marker.LastModified == nil {
+				continue
+			}
+			versions = append(versions, objectVersionInfo{
+				VersionID:    aws.ToString(marker.VersionId),
+				Key:          key,
+				IsLatest:     aws.ToBool(marker.IsLatest),
+				LastModified: aws.ToTime(marker.LastModified),
+				DeleteMarker: true,
+			})
+		}
+		if !aws.ToBool(result.IsTruncated) {
+			break
+		}
+		input.KeyMarker = result.NextKeyMarker
+		input.VersionIdMarker = result.NextVersionIdMarker
+	}
+	sort.Slice(versions, func(i, j int) bool { return versions[i].LastModified.After(versions[j].LastModified) })
+	write(w, map[string]any{"versions": versions})
+}
+
+func (s *Server) deleteVersion(w http.ResponseWriter, r *http.Request) {
+	session, _, data, err := s.unlocked(r)
+	if err != nil {
+		fail(w, http.StatusLocked, err)
+		return
+	}
+	key := r.URL.Query().Get("key")
+	versionID := r.URL.Query().Get("versionId")
+	if key == "" || versionID == "" {
+		fail(w, http.StatusBadRequest, errors.New("object key and version ID are required"))
+		return
+	}
+	c, err := s.connection(r, data, session.User)
+	if err != nil {
+		fail(w, http.StatusNotFound, err)
+		return
+	}
+	client, err := s3client.New(r.Context(), c)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	_, err = client.DeleteObject(r.Context(), &s3.DeleteObjectInput{
+		Bucket:    aws.String(c.Bucket),
+		Key:       aws.String(key),
+		VersionId: aws.String(versionID),
+	})
+	if err != nil {
+		fail(w, http.StatusBadGateway, err)
+		return
+	}
+	s.audit(session, "object.version_delete", "success", map[string]string{"connection_id": c.ID, "bucket": c.Bucket, "object_key": key})
+	write(w, map[string]bool{"ok": true})
+}
+
+func (s *Server) multipartUploads(w http.ResponseWriter, r *http.Request) {
+	session, _, data, err := s.unlocked(r)
+	if err != nil {
+		fail(w, http.StatusLocked, err)
+		return
+	}
+	c, err := s.connection(r, data, session.User)
+	if err != nil {
+		fail(w, http.StatusNotFound, err)
+		return
+	}
+	client, err := s3client.New(r.Context(), c)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	input := &s3.ListMultipartUploadsInput{Bucket: aws.String(c.Bucket)}
+	if prefix := r.URL.Query().Get("prefix"); prefix != "" {
+		input.Prefix = aws.String(prefix)
+	} else if c.Prefix != "" {
+		input.Prefix = aws.String(c.Prefix)
+	}
+	uploads := make([]multipartUploadInfo, 0)
+	for {
+		result, listErr := client.ListMultipartUploads(r.Context(), input)
+		if listErr != nil {
+			fail(w, http.StatusBadGateway, listErr)
+			return
+		}
+		for _, upload := range result.Uploads {
+			if upload.UploadId == nil || upload.Key == nil || upload.Initiated == nil {
+				continue
+			}
+			uploads = append(uploads, multipartUploadInfo{
+				UploadID:  aws.ToString(upload.UploadId),
+				Key:       aws.ToString(upload.Key),
+				Initiated: aws.ToTime(upload.Initiated),
+			})
+		}
+		if !aws.ToBool(result.IsTruncated) {
+			break
+		}
+		input.KeyMarker = result.NextKeyMarker
+		input.UploadIdMarker = result.NextUploadIdMarker
+	}
+	sort.Slice(uploads, func(i, j int) bool { return uploads[i].Initiated.Before(uploads[j].Initiated) })
+	write(w, map[string]any{"uploads": uploads})
+}
+
+func (s *Server) multipartAbort(w http.ResponseWriter, r *http.Request) {
+	session, _, data, err := s.unlocked(r)
+	if err != nil {
+		fail(w, http.StatusLocked, err)
+		return
+	}
+	uploadID := r.URL.Query().Get("uploadId")
+	if uploadID == "" {
+		fail(w, http.StatusBadRequest, errors.New("upload ID is required"))
+		return
+	}
+	c, err := s.connection(r, data, session.User)
+	if err != nil {
+		fail(w, http.StatusNotFound, err)
+		return
+	}
+	client, err := s3client.New(r.Context(), c)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	_, err = client.AbortMultipartUpload(r.Context(), &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(c.Bucket),
+		UploadId: aws.String(uploadID),
+		Key:      aws.String(r.URL.Query().Get("key")),
+	})
+	if err != nil {
+		fail(w, http.StatusBadGateway, err)
+		return
+	}
+	s.audit(session, "multipart.abort", "success", map[string]string{"connection_id": c.ID, "bucket": c.Bucket, "object_key": r.URL.Query().Get("key")})
+	write(w, map[string]bool{"ok": true})
+}
+
 func (s *Server) file(w http.ResponseWriter, r *http.Request) {
 	session, _, data, err := s.unlocked(r)
 	if err != nil {
@@ -805,7 +1096,12 @@ func (s *Server) file(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, err)
 		return
 	}
-	object, err := client.GetObject(r.Context(), &s3.GetObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(r.URL.Query().Get("key"))})
+	key := r.URL.Query().Get("key")
+	input := &s3.GetObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(key)}
+	if versionID := r.URL.Query().Get("versionId"); versionID != "" {
+		input.VersionId = aws.String(versionID)
+	}
+	object, err := client.GetObject(r.Context(), input)
 	if err != nil {
 		fail(w, 502, err)
 		return
@@ -814,7 +1110,7 @@ func (s *Server) file(w http.ResponseWriter, r *http.Request) {
 	if object.ContentType != nil {
 		w.Header().Set("Content-Type", aws.ToString(object.ContentType))
 	}
-	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(r.URL.Query().Get("key"))))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(key)))
 	_, _ = io.Copy(w, object.Body)
 }
 func (s *Server) deleteFile(w http.ResponseWriter, r *http.Request) {
@@ -836,27 +1132,76 @@ func (s *Server) deleteFile(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
 	digest := ""
 	if strings.HasSuffix(key, "/") {
-		var token *string
+		versionInput := &s3.ListObjectVersionsInput{Bucket: aws.String(c.Bucket), Prefix: aws.String(key)}
+		versionObjects := make([]types.ObjectIdentifier, 0)
 		for {
-			list, listErr := client.ListObjectsV2(r.Context(), &s3.ListObjectsV2Input{Bucket: aws.String(c.Bucket), Prefix: aws.String(key), ContinuationToken: token})
+			versions, listErr := client.ListObjectVersions(r.Context(), versionInput)
 			if listErr != nil {
 				fail(w, 502, listErr)
 				return
 			}
-			objects := make([]types.ObjectIdentifier, 0, len(list.Contents))
-			for _, object := range list.Contents {
-				objects = append(objects, types.ObjectIdentifier{Key: object.Key})
-			}
-			if len(objects) > 0 {
-				if _, err = client.DeleteObjects(r.Context(), &s3.DeleteObjectsInput{Bucket: aws.String(c.Bucket), Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)}}); err != nil {
-					fail(w, 502, err)
-					return
+			for _, version := range versions.Versions {
+				if version.Key != nil && version.VersionId != nil {
+					versionObjects = append(versionObjects, types.ObjectIdentifier{Key: version.Key, VersionId: version.VersionId})
 				}
 			}
-			if !aws.ToBool(list.IsTruncated) {
+			for _, marker := range versions.DeleteMarkers {
+				if marker.Key != nil && marker.VersionId != nil {
+					versionObjects = append(versionObjects, types.ObjectIdentifier{Key: marker.Key, VersionId: marker.VersionId})
+				}
+			}
+			if !aws.ToBool(versions.IsTruncated) {
 				break
 			}
-			token = list.NextContinuationToken
+			versionInput.KeyMarker = versions.NextKeyMarker
+			versionInput.VersionIdMarker = versions.NextVersionIdMarker
+		}
+		for start := 0; start < len(versionObjects); start += 1000 {
+			end := start + 1000
+			if end > len(versionObjects) {
+				end = len(versionObjects)
+			}
+			result, deleteErr := client.DeleteObjects(r.Context(), &s3.DeleteObjectsInput{
+				Bucket: aws.String(c.Bucket),
+				Delete: &types.Delete{Objects: versionObjects[start:end], Quiet: aws.Bool(true)},
+			})
+			if deleteErr != nil {
+				fail(w, 502, deleteErr)
+				return
+			}
+			if len(result.Errors) > 0 {
+				fail(w, 502, fmt.Errorf("S3 rejected %d object version deletions", len(result.Errors)))
+				return
+			}
+		}
+		if len(versionObjects) == 0 {
+			var token *string
+			for {
+				list, listErr := client.ListObjectsV2(r.Context(), &s3.ListObjectsV2Input{Bucket: aws.String(c.Bucket), Prefix: aws.String(key), ContinuationToken: token})
+				if listErr != nil {
+					fail(w, 502, listErr)
+					return
+				}
+				objects := make([]types.ObjectIdentifier, 0, len(list.Contents))
+				for _, object := range list.Contents {
+					objects = append(objects, types.ObjectIdentifier{Key: object.Key})
+				}
+				if len(objects) > 0 {
+					result, deleteErr := client.DeleteObjects(r.Context(), &s3.DeleteObjectsInput{Bucket: aws.String(c.Bucket), Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)}})
+					if deleteErr != nil {
+						fail(w, 502, deleteErr)
+						return
+					}
+					if len(result.Errors) > 0 {
+						fail(w, 502, fmt.Errorf("S3 rejected %d object deletions", len(result.Errors)))
+						return
+					}
+				}
+				if !aws.ToBool(list.IsTruncated) {
+					break
+				}
+				token = list.NextContinuationToken
+			}
 		}
 	} else {
 		digest, err = objectDigest(r.Context(), client, c.Bucket, key)

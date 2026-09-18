@@ -141,18 +141,20 @@ spec:
             {{- end }}
           readinessProbe:
             httpGet:
-              path: /api/me
+              path: /api/healthz
               port: http
             initialDelaySeconds: 3
             periodSeconds: 10
           livenessProbe:
             httpGet:
-              path: /api/me
+              path: /api/healthz
               port: http
             initialDelaySeconds: 10
             periodSeconds: 20
+          {{- with .Values.resources }}
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: data
               mountPath: /data
@@ -247,8 +249,10 @@ spec:
             runAsGroup: 65532
             seccompProfile:
               type: RuntimeDefault
+          {{- with .Values.resources }}
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: data
               mountPath: /data

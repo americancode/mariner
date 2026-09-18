@@ -12,8 +12,10 @@ import {
   LoaderCircle,
   LockKeyhole,
   Moon,
+  MoreVertical,
   Pencil,
   Plus,
+  RefreshCw,
   Shield,
   Trash2,
   Upload,
@@ -21,10 +23,32 @@ import {
   UnlockKeyhole,
   X,
 } from "lucide-react";
-import { api, AuditEvent, BrowseKind, Connection, Item, Organization } from "./api";
+import {
+  api,
+  AuditEvent,
+  Connection,
+  Item,
+  MultipartUpload,
+  ObjectVersion,
+  Organization,
+} from "./api";
 
 type User = { authenticated: boolean; name?: string; isAdmin?: boolean };
 type ErrorHandler = (message: string) => void;
+type ItemFilter = { files: boolean; folders: boolean; multipart: boolean };
+const defaultItemFilter: ItemFilter = { files: true, folders: true, multipart: false };
+function browseKind(filter: ItemFilter): "all" | "file" | "folder" {
+  if (filter.files && !filter.folders) return "file";
+  if (filter.folders && !filter.files) return "folder";
+  return "all";
+}
+function multipartSelectionKey(upload: MultipartUpload) {
+  return `multipart:${upload.uploadId}`;
+}
+function sameItemFilter(left: ItemFilter, right: ItemFilter) {
+  return left.files === right.files && left.folders === right.folders && left.multipart === right.multipart;
+}
+
 const promptUnlockAfterSignInKey = "mariner_prompt_unlock_after_sign_in";
 const themeStorageKey = "mariner.theme";
 
@@ -52,6 +76,7 @@ type ConnectionForm = {
 type Activity = {
   id: string;
   label: string;
+  context: string;
   kind: "upload" | "delete" | "download";
   progress: number;
   state: "active" | "done" | "error";
@@ -71,7 +96,8 @@ export function App() {
   const [activeConnection, setActiveConnection] = useState<Connection>();
   const [prefix, setPrefix] = useState("");
   const [items, setItems] = useState<Item[]>([]);
-  const [itemFilter, setItemFilter] = useState<BrowseKind>("all");
+  const [itemFilter, setItemFilter] = useState<ItemFilter>(defaultItemFilter);
+  const [searchQuery, setSearchQuery] = useState("");
   const [nextToken, setNextToken] = useState("");
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -85,8 +111,8 @@ export function App() {
   const [connectionDeleteTarget, setConnectionDeleteTarget] =
     useState<Connection>();
   const [darkMode, setDarkMode] = useState(storedThemeIsDark);
-  const currentView = useRef({ activeConnection, prefix, itemFilter });
-  currentView.current = { activeConnection, prefix, itemFilter };
+  const currentView = useRef({ activeConnection, prefix, itemFilter, searchQuery });
+  currentView.current = { activeConnection, prefix, itemFilter, searchQuery };
   function setTheme(theme: "light" | "dark") {
     setDarkMode(theme === "dark");
     window.localStorage.setItem(themeStorageKey, theme);
@@ -132,9 +158,10 @@ export function App() {
   ) {
     setActiveConnection(connection);
     setPrefix(nextPrefix);
+    setSearchQuery("");
     setLoading(true);
     try {
-      const result = await api.browse(connection.id, nextPrefix, kind);
+      const result = await api.browse(connection.id, nextPrefix, browseKind(kind));
       setItems(result.items);
       setNextToken(result.nextToken ?? "");
       setHasMore(result.hasMore);
@@ -148,16 +175,35 @@ export function App() {
     const view = currentView.current;
     if (!view.activeConnection) return;
     try {
+      if (view.searchQuery.trim()) {
+        const result = await api.search(
+          view.activeConnection.id,
+          view.prefix,
+          view.searchQuery,
+          browseKind(view.itemFilter),
+        );
+        const latestView = currentView.current;
+        if (
+          latestView.activeConnection?.id !== view.activeConnection.id ||
+          latestView.prefix !== view.prefix ||
+          !sameItemFilter(latestView.itemFilter, view.itemFilter) ||
+          latestView.searchQuery !== view.searchQuery
+        ) return;
+        setItems(result.items);
+        setNextToken("");
+        setHasMore(false);
+        return;
+      }
       const result = await api.browse(
         view.activeConnection.id,
         view.prefix,
-        view.itemFilter,
+        browseKind(view.itemFilter),
       );
       const latestView = currentView.current;
       if (
         latestView.activeConnection?.id !== view.activeConnection.id ||
         latestView.prefix !== view.prefix ||
-        latestView.itemFilter !== view.itemFilter
+        !sameItemFilter(latestView.itemFilter, view.itemFilter)
       ) {
         return;
       }
@@ -169,13 +215,13 @@ export function App() {
     }
   }
   async function loadMore() {
-    if (!activeConnection || !hasMore || loading) return;
+    if (!activeConnection || !hasMore || loading || searchQuery.trim()) return;
     setLoadingMore(true);
     try {
       const result = await api.browse(
         activeConnection.id,
         prefix,
-        itemFilter,
+        browseKind(itemFilter),
         nextToken,
       );
       setItems((current) => [...current, ...result.items]);
@@ -272,11 +318,43 @@ export function App() {
         onLoadMore={loadMore}
         loadingMore={loadingMore}
         itemFilter={itemFilter}
+        searchQuery={searchQuery}
         vaultUnlocked={vaultUnlocked}
         onUnlock={() => setUnlockOpen(true)}
-        onFilterChange={(kind) => {
-          setItemFilter(kind);
-          if (activeConnection) browse(activeConnection, prefix, kind);
+        onSearchChange={(query) => {
+          setSearchQuery(query);
+          if (!activeConnection) return;
+          if (query.trim()) {
+            setLoading(true);
+            api
+              .search(activeConnection.id, prefix, query, browseKind(itemFilter))
+              .then((result) => {
+                setItems(result.items);
+                setNextToken("");
+                setHasMore(false);
+              })
+              .catch((err) => setError(errorMessage(err)))
+              .finally(() => setLoading(false));
+          } else {
+            browse(activeConnection, prefix, itemFilter);
+          }
+        }}
+        onFilterChange={(nextFilter) => {
+          setItemFilter(nextFilter);
+          if (activeConnection) {
+            if (searchQuery.trim()) {
+              setLoading(true);
+              api
+                .search(activeConnection.id, prefix, searchQuery, browseKind(nextFilter))
+                .then((result) => {
+                  setItems(result.items);
+                  setNextToken("");
+                  setHasMore(false);
+                })
+                .catch((err) => setError(errorMessage(err)))
+                .finally(() => setLoading(false));
+            } else browse(activeConnection, prefix, nextFilter);
+          }
         }}
       />
       {unlockOpen && (
@@ -564,6 +642,7 @@ function Sidebar({
       <span className="eyebrow">SIGNED IN AS</span>
       <p>{userName?.trim() || "OIDC user"}</p>
       <span className="eyebrow">CONNECTIONS</span>
+      <div className="connection-list">
       {connections.map((connection) => (
         <button
           disabled={!vaultUnlocked}
@@ -619,6 +698,7 @@ function Sidebar({
           )}
         </button>
       ))}
+      </div>
       <button
         className="secondary add"
         disabled={!vaultUnlocked}
@@ -670,6 +750,8 @@ function Workspace({
   onLoadMore,
   loadingMore,
   itemFilter,
+  searchQuery,
+  onSearchChange,
   vaultUnlocked,
   onUnlock,
   onFilterChange,
@@ -684,10 +766,12 @@ function Workspace({
   hasMore: boolean;
   onLoadMore: () => Promise<void>;
   loadingMore: boolean;
-  itemFilter: BrowseKind;
+  itemFilter: ItemFilter;
+  searchQuery: string;
+  onSearchChange: (query: string) => void;
   vaultUnlocked: boolean;
   onUnlock: () => void;
-  onFilterChange: (kind: BrowseKind) => void;
+  onFilterChange: (filter: ItemFilter) => void;
 }) {
   const [activities, setActivities] = useState<Activity[]>([]);
   useEffect(() => {
@@ -736,6 +820,8 @@ function Workspace({
             onLoadMore={onLoadMore}
             loadingMore={loadingMore}
             itemFilter={itemFilter}
+            searchQuery={searchQuery}
+            onSearchChange={onSearchChange}
             onFilterChange={onFilterChange}
           />
         )
@@ -1153,6 +1239,8 @@ function Explorer({
   onLoadMore,
   loadingMore,
   itemFilter,
+  searchQuery,
+  onSearchChange,
   onFilterChange,
 }: {
   connection: Connection;
@@ -1165,14 +1253,63 @@ function Explorer({
   hasMore: boolean;
   onLoadMore: () => Promise<void>;
   loadingMore: boolean;
-  itemFilter: BrowseKind;
-  onFilterChange: (kind: BrowseKind) => void;
+  itemFilter: ItemFilter;
+  searchQuery: string;
+  onSearchChange: (query: string) => void;
+  onFilterChange: (filter: ItemFilter) => void;
 }) {
   const [folderOpen, setFolderOpen] = useState(false);
+  const [searchInput, setSearchInput] = useState(searchQuery);
   const [dragging, setDragging] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Item>();
   const [deleteSelectionOpen, setDeleteSelectionOpen] = useState(false);
-  const visibleItems = items;
+  const [multipartUploads, setMultipartUploads] = useState<MultipartUpload[]>([]);
+  const [multipartLoading, setMultipartLoading] = useState(true);
+  const [multipartError, setMultipartError] = useState("");
+  const [multipartAbortTarget, setMultipartAbortTarget] =
+    useState<MultipartUpload>();
+  useEffect(() => setSearchInput(searchQuery), [searchQuery]);
+  useEffect(() => {
+    if (searchInput === searchQuery) return;
+    const timer = window.setTimeout(() => onSearchChange(searchInput), 350);
+    return () => window.clearTimeout(timer);
+  }, [searchInput, searchQuery, onSearchChange]);
+  useEffect(() => {
+    let current = true;
+    setMultipartLoading(true);
+    setMultipartError("");
+    api
+      .multipartUploads(connection.id, prefix)
+      .then(({ uploads }) => {
+        if (current) setMultipartUploads(uploads);
+      })
+      .catch((err) => {
+        if (current) setMultipartError(errorMessage(err));
+      })
+      .finally(() => {
+        if (current) setMultipartLoading(false);
+      });
+    return () => {
+      current = false;
+    };
+  }, [connection.id, prefix]);
+
+  async function confirmAbortMultipart() {
+    if (!multipartAbortTarget) return;
+    try {
+      await api.abortMultipart(connection.id, multipartAbortTarget);
+      setMultipartUploads((current) =>
+        current.filter((item) => item.uploadId !== multipartAbortTarget.uploadId),
+      );
+      setMultipartAbortTarget(undefined);
+    } catch (err) {
+      onError(errorMessage(err));
+    }
+  }
+  const visibleItems = items.filter((item) =>
+    item.kind === "file" ? itemFilter.files : itemFilter.folders,
+  );
+  const visibleMultipartUploads = itemFilter.multipart ? multipartUploads : [];
   const breadcrumbSegments = prefix
     .split("/")
     .filter(Boolean)
@@ -1180,12 +1317,14 @@ function Explorer({
       name,
       prefix: `${segments.slice(0, index + 1).join("/")}/`,
     }));
+  const activityContext = `${connection.name} / ${connection.bucket}`;
   async function downloadArchive(format: "zip" | "tgz") {
+    if (Array.from(selected).some((key) => key.startsWith("multipart:"))) return;
     const id = `${Date.now()}-${format}`;
     const label = `${connection.bucket}${prefix ? `/${prefix}` : ""}.${format}`;
     setActivities((current) => [
       ...current,
-      { id, label, kind: "download", progress: 35, state: "active" },
+      { id, label, context: activityContext, kind: "download", progress: 35, state: "active" },
     ]);
     try {
       const blob = await api.download(connection.id, prefix, format);
@@ -1214,6 +1353,12 @@ function Explorer({
   }
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [selectionAnchor, setSelectionAnchor] = useState<string>();
+  const selectableKeys = [
+    ...visibleItems.map((item) => item.key),
+    ...visibleMultipartUploads.map(multipartSelectionKey),
+  ];
+  const allVisibleSelected =
+    selectableKeys.length > 0 && selectableKeys.every((key) => selected.has(key));
 
   function toggleSelected(key: string) {
     setSelectionAnchor(key);
@@ -1243,7 +1388,7 @@ function Explorer({
   function selectAll() {
     setSelected(
       (current) =>
-        new Set([...current, ...visibleItems.map((item) => item.key)]),
+        new Set([...current, ...selectableKeys]),
     );
   }
   async function deleteSelected() {
@@ -1251,7 +1396,7 @@ function Explorer({
     setDeleteSelectionOpen(true);
   }
   async function confirmDeleteSelected() {
-    const pending = Array.from(selected).map((key, index) => {
+    const pending = Array.from(selected).filter((key) => !key.startsWith("multipart:" )).map((key, index) => {
       const item = items.find((candidate) => candidate.key === key);
       return {
         key,
@@ -1259,12 +1404,28 @@ function Explorer({
         label: item?.name || key,
       };
     });
-    if (!pending.length) return;
+    const selectedMultipart = multipartUploads.filter((upload) =>
+      selected.has(multipartSelectionKey(upload)),
+    );
+    const pendingMultipart = selectedMultipart.map((upload, index) => ({
+      upload,
+      id: `${Date.now()}-abort-${index}-${upload.uploadId}`,
+    }));
+    if (!pending.length && !pendingMultipart.length) return;
     setActivities((current) => [
       ...current,
       ...pending.map(({ id, label }) => ({
         id,
         label,
+        context: activityContext,
+        kind: "delete" as const,
+        progress: 0,
+        state: "active" as const,
+      })),
+      ...pendingMultipart.map(({ upload, id }) => ({
+        id,
+        label: upload.key,
+        context: activityContext,
         kind: "delete" as const,
         progress: 0,
         state: "active" as const,
@@ -1274,6 +1435,31 @@ function Explorer({
       pending.map(async ({ key, id }) => {
         try {
           await api.deleteFile(connection.id, key);
+          setActivities((current) =>
+            current.map((activity) =>
+              activity.id === id
+                ? { ...activity, progress: 100, state: "done", finishedAt: Date.now() }
+                : activity,
+            ),
+          );
+        } catch (err) {
+          setActivities((current) =>
+            current.map((activity) =>
+              activity.id === id
+                ? { ...activity, state: "error", error: errorMessage(err), finishedAt: Date.now() }
+                : activity,
+            ),
+          );
+        }
+      }),
+    );
+    await Promise.all(
+      pendingMultipart.map(async ({ upload, id }) => {
+        try {
+          await api.abortMultipart(connection.id, upload);
+          setMultipartUploads((current) =>
+            current.filter((item) => item.uploadId !== upload.uploadId),
+          );
           setActivities((current) =>
             current.map((activity) =>
               activity.id === id
@@ -1307,6 +1493,7 @@ function Explorer({
       ...pending.map(({ file, id }) => ({
         id,
         label: file.name,
+        context: activityContext,
         kind: "upload" as const,
         progress: 0,
         state: "active" as const,
@@ -1386,36 +1573,43 @@ function Explorer({
         <button className="secondary" onClick={() => setFolderOpen(true)}>
           <FolderPlus size={16} /> New folder
         </button>
-        <DownloadMenu onDownload={downloadArchive} />
+        <DownloadMenu
+          onDownload={downloadArchive}
+          disabled={Array.from(selected).some((key) => key.startsWith("multipart:"))}
+        />
+        <button
+          type="button"
+          className="secondary compact"
+          aria-label="Reload current view"
+          title="Reload current view"
+          onClick={() => void onRefresh()}
+        >
+          <RefreshCw size={16} />
+          <span>Refresh</span>
+        </button>
         <button
           className="secondary"
           onClick={
-            visibleItems.length > 0 &&
-            visibleItems.every((item) => selected.has(item.key))
+            allVisibleSelected
               ? () =>
                   setSelected(
                     (current) =>
                       new Set(
-                        [...current].filter(
-                          (key) =>
-                            !visibleItems.some((item) => item.key === key),
-                        ),
+                        [...current].filter((key) => !selectableKeys.includes(key)),
                       ),
                   )
               : selectAll
           }
         >
-          {visibleItems.length > 0 &&
-          visibleItems.every((item) => selected.has(item.key))
-            ? "Unselect all"
-            : "Select all"}
+          {allVisibleSelected ? "Unselect all" : "Select all"}
         </button>
         <button
           className="danger compact"
           disabled={!selected.size}
           onClick={deleteSelected}
         >
-          <Trash2 size={15} /> Delete
+          <Trash2 size={16} />
+          Delete
           {selected.size ? ` (${selected.size})` : ""}
         </button>
       </div>
@@ -1430,23 +1624,104 @@ function Explorer({
         <span />
       </div>
       <div className="item-filter" aria-label="Filter bucket contents">
-        {(
-          [
-            ["all", "All"],
-            ["file", "Files"],
-            ["folder", "Folders"],
-          ] as const
-        ).map(([value, label]) => (
+        {(itemFilter.files || itemFilter.folders || itemFilter.multipart) && (
+          <div className="filter-group" aria-label="Active object filters">
+            {itemFilter.files && (
+              <button
+                type="button"
+                className="active"
+                aria-pressed="true"
+                onClick={() => onFilterChange({ ...itemFilter, files: false })}
+              >
+                Files
+              </button>
+            )}
+            {itemFilter.folders && (
+              <button
+                type="button"
+                className="active"
+                aria-pressed="true"
+                onClick={() => onFilterChange({ ...itemFilter, folders: false })}
+              >
+                Folders
+              </button>
+            )}
+            {itemFilter.multipart && (
+              <button
+                type="button"
+                className="active"
+                aria-pressed="true"
+                onClick={() => onFilterChange({ ...itemFilter, multipart: false })}
+              >
+                Multipart
+              </button>
+            )}
+          </div>
+        )}
+        {!itemFilter.files && (
           <button
-            key={value}
             type="button"
-            className={itemFilter === value ? "active" : ""}
-            onClick={() => onFilterChange(value)}
+            aria-pressed="false"
+            onClick={() => onFilterChange({ ...itemFilter, files: true })}
           >
-            {label}
+            Files
           </button>
-        ))}
+        )}
+        {!itemFilter.folders && (
+          <button
+            type="button"
+            aria-pressed="false"
+            onClick={() => onFilterChange({ ...itemFilter, folders: true })}
+          >
+            Folders
+          </button>
+        )}
+        {!itemFilter.multipart && (
+          <button
+            type="button"
+            aria-pressed="false"
+            onClick={() => onFilterChange({ ...itemFilter, multipart: true })}
+          >
+            Multipart
+          </button>
+        )}
+        <label className="bucket-search">
+          <span className="sr-only">Search this level</span>
+          <input
+            type="search"
+            value={searchInput}
+            placeholder="Search this level"
+            onChange={(event) => setSearchInput(event.target.value)}
+          />
+          {searchInput && (
+            <button
+              type="button"
+              className="bucket-search-clear"
+              aria-label="Clear search"
+              onClick={() => setSearchInput("")}
+            >
+              <X size={14} />
+            </button>
+          )}
+        </label>
       </div>
+      {multipartLoading && itemFilter.multipart && (
+        <p className="filtered-empty">Checking for incomplete multipart uploads…</p>
+      )}
+      {multipartError && itemFilter.multipart && (
+        <p className="form-error" role="alert">
+          Unable to list incomplete multipart uploads: {multipartError}
+        </p>
+      )}
+      {!multipartLoading && !multipartError && visibleMultipartUploads.map((upload) => (
+        <MultipartUploadRow
+          key={upload.uploadId}
+          upload={upload}
+          selected={selected.has(multipartSelectionKey(upload))}
+          onToggleSelected={() => toggleSelected(multipartSelectionKey(upload))}
+          onAbort={() => setMultipartAbortTarget(upload)}
+        />
+      ))}
       {visibleItems.map((item) => (
         <ExplorerRow
           key={item.key}
@@ -1461,9 +1736,13 @@ function Explorer({
           onSelectFromRow={selectFromRow}
         />
       ))}
-      {!visibleItems.length && items.length > 0 && (
+      {!visibleItems.length &&
+        !visibleMultipartUploads.length &&
+        (items.length > 0 || itemFilter.multipart) && (
         <p className="filtered-empty">
-          No {itemFilter === "file" ? "files" : "folders"} in this location.
+          {itemFilter.multipart && !itemFilter.files && !itemFilter.folders
+            ? "No incomplete multipart uploads in this location."
+            : "No matching items in this location."}
         </p>
       )}
       {hasMore && (
@@ -1499,6 +1778,7 @@ function Explorer({
               {
                 id,
                 label: deleteTarget.name,
+                context: activityContext,
                 kind: "delete",
                 progress: 0,
                 state: "active",
@@ -1529,11 +1809,19 @@ function Explorer({
       {deleteSelectionOpen && (
         <DeleteFileModal
           count={selected.size}
+          multipartCount={Array.from(selected).filter((key) => key.startsWith("multipart:")).length}
           onCancel={() => setDeleteSelectionOpen(false)}
           onConfirm={async () => {
             setDeleteSelectionOpen(false);
             await confirmDeleteSelected();
           }}
+        />
+      )}
+      {multipartAbortTarget && (
+        <AbortMultipartModal
+          upload={multipartAbortTarget}
+          onCancel={() => setMultipartAbortTarget(undefined)}
+          onConfirm={confirmAbortMultipart}
         />
       )}
     </section>
@@ -1542,10 +1830,15 @@ function Explorer({
 
 function DownloadMenu({
   onDownload,
+  disabled = false,
 }: {
   onDownload: (format: "zip" | "tgz") => void;
+  disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
   function choose(format: "zip" | "tgz") {
     setOpen(false);
     onDownload(format);
@@ -1557,11 +1850,12 @@ function DownloadMenu({
         className="secondary download-trigger"
         aria-haspopup="menu"
         aria-expanded={open}
+        disabled={disabled}
         onClick={() => setOpen((value) => !value)}
       >
         <Download size={16} />
         <span>Download</span>
-        <ChevronDown size={15} />
+        <ChevronDown size={16} />
       </button>
       {open && (
         <div className="download-options" role="menu">
@@ -1635,26 +1929,31 @@ function FolderModal({
 function DeleteFileModal({
   item,
   count,
+  multipartCount = 0,
   onCancel,
   onConfirm,
 }: {
   item?: Item;
   count?: number;
+  multipartCount?: number;
   onCancel: () => void;
   onConfirm: () => Promise<void>;
 }) {
   const multiple = !item;
+  const hasMultipart = multipartCount > 0;
   return (
     <div className="modal-backdrop">
       <div className="card small-modal">
         <div className="modal-heading">
           <div>
             <span className="eyebrow">
-              DELETE {multiple ? "ITEMS" : item?.kind === "folder" ? "FOLDER" : "FILE"}
+              {hasMultipart ? "DELETE / ABORT" : "DELETE"} {multiple ? "ITEMS" : item?.kind === "folder" ? "FOLDER" : "FILE"}
             </span>
             <h2>
               {multiple
-                ? `Delete ${count} selected items?`
+                ? hasMultipart
+                  ? `Delete selected items and abort ${multipartCount} upload${multipartCount === 1 ? "" : "s"}?`
+                  : `Delete ${count} selected items?`
                 : item?.kind === "folder"
                   ? "Delete this folder?"
                   : "Delete this file?"}
@@ -1667,7 +1966,9 @@ function DeleteFileModal({
         <p className="modal-description">
           This will permanently delete{" "}
           {multiple ? (
-            "the selected items"
+            hasMultipart
+              ? "the selected files/folders and abort the selected multipart uploads"
+              : "the selected items"
           ) : (
             <>
               <><strong>{item?.name}</strong>{item?.kind === "folder" && " and everything inside it"}</>
@@ -1680,7 +1981,7 @@ function DeleteFileModal({
             Cancel
           </button>
           <button className="danger" onClick={onConfirm}>
-            Delete {multiple ? "items" : item?.kind === "folder" ? "folder" : "file"}
+            {hasMultipart ? "Delete / Abort" : "Delete"} {multiple ? "items" : item?.kind === "folder" ? "folder" : "file"}
           </button>
         </div>
       </div>
@@ -1728,6 +2029,55 @@ function DeleteConnectionModal({
           </button>
           <button type="button" className="danger" onClick={onConfirm}>
             <Trash2 size={15} /> Delete connection
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AbortMultipartModal({
+  upload,
+  onCancel,
+  onConfirm,
+}: {
+  upload: MultipartUpload;
+  onCancel: () => void;
+  onConfirm: () => Promise<void>;
+}) {
+  return (
+    <div className="modal-backdrop">
+      <div className="card small-modal">
+        <div className="modal-heading">
+          <div>
+            <span className="eyebrow">INCOMPLETE MULTIPART UPLOAD</span>
+            <h2>Abort this upload?</h2>
+          </div>
+          <button
+            type="button"
+            className="modal-close"
+            onClick={onCancel}
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+        <div className="modal-warning">
+          <AlertTriangle size={20} aria-hidden="true" />
+          <p>
+            This will permanently delete the incomplete S3 parts for{" "}
+            <strong>{upload.key}</strong>. No completed object will be deleted.
+          </p>
+        </div>
+        <p className="modal-description">
+          Started {new Date(upload.initiated).toLocaleString()}.
+        </p>
+        <div className="modal-actions">
+          <button type="button" className="secondary" onClick={onCancel}>
+            Keep upload
+          </button>
+          <button type="button" className="danger" onClick={onConfirm}>
+            <Trash2 size={15} /> Abort upload
           </button>
         </div>
       </div>
@@ -1790,6 +2140,7 @@ function ActivityTray({
                   style={{ width: `${activity.progress}%` }}
                 />
               </div>
+              <small className="activity-context">{activity.context}</small>
               <small>
                 {activity.state === "active" ? (
                   activity.kind === "upload" ? (
@@ -1810,6 +2161,111 @@ function ActivityTray({
         </div>
       )}
     </div>
+  );
+}
+
+function MultipartUploadRow({
+  upload,
+  selected,
+  onToggleSelected,
+  onAbort,
+}: {
+  upload: MultipartUpload;
+  selected: boolean;
+  onToggleSelected: () => void;
+  onAbort: () => void;
+}) {
+  return (
+    <div className="table row multipart-upload-row">
+      <input
+        type="checkbox"
+        checked={selected}
+        onChange={onToggleSelected}
+        aria-label={`Select incomplete multipart upload ${upload.key}`}
+      />
+      <span className="multipart-upload-name">
+        <span>
+          <Upload size={18} /> {upload.key}
+        </span>
+      </span>
+      <span>Multipart upload</span>
+      <span>Incomplete</span>
+      <span className="row-actions">
+        <RowActionMenu
+          label={`Actions for incomplete multipart upload ${upload.key}`}
+          actions={[{ label: "Abort upload", danger: true, onSelect: onAbort }]}
+        />
+      </span>
+    </div>
+  );
+}
+
+type RowAction = {
+  label: string;
+  danger?: boolean;
+  onSelect: () => void | Promise<void>;
+};
+
+function RowActionMenu({ label, actions }: { label: string; actions: RowAction[] }) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => {
+    const close = () => setOpen(false);
+    const onPointerDown = (event: PointerEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) close();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("mariner:close-row-menus", close);
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("mariner:close-row-menus", close);
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+
+  function toggle(event: React.MouseEvent) {
+    event.stopPropagation();
+    if (!open) window.dispatchEvent(new Event("mariner:close-row-menus"));
+    setOpen((current) => !current);
+  }
+
+  return (
+    <span className="row-menu" ref={menuRef}>
+      <button
+        type="button"
+        className="icon row-menu-trigger"
+        onClick={toggle}
+        aria-label={label}
+        aria-expanded={open}
+        title="More actions"
+      >
+        <MoreVertical size={18} />
+      </button>
+      {open && (
+        <div className="row-menu-options" role="menu">
+          {actions.map((action) => (
+            <button
+              type="button"
+              key={action.label}
+              className={action.danger ? "danger-action" : ""}
+              role="menuitem"
+              onClick={(event) => {
+                event.stopPropagation();
+                setOpen(false);
+                void action.onSelect();
+              }}
+            >
+              {action.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </span>
   );
 }
 
@@ -1834,46 +2290,231 @@ function ExplorerRow({
   onToggleSelected: (key: string) => void;
   onSelectFromRow: (key: string, event: React.MouseEvent) => boolean;
 }) {
-  async function remove(event: React.MouseEvent) {
-    event.stopPropagation();
+  const [versionsOpen, setVersionsOpen] = useState(false);
+  const [versions, setVersions] = useState<ObjectVersion[]>([]);
+  const [versionsLoading, setVersionsLoading] = useState(false);
+  const [versionsError, setVersionsError] = useState("");
+  const [deleteVersionTarget, setDeleteVersionTarget] = useState<ObjectVersion>();
+
+  async function toggleVersions() {
+    if (versionsOpen) {
+      setVersionsOpen(false);
+      return;
+    }
+    setVersionsOpen(true);
+    setVersionsLoading(true);
+    setVersionsError("");
+    try {
+      const result = await api.versions(connection.id, item.key);
+      setVersions(result.versions);
+    } catch (err) {
+      setVersionsError(errorMessage(err));
+    } finally {
+      setVersionsLoading(false);
+    }
+  }
+
+  async function confirmDeleteVersion() {
+    if (!deleteVersionTarget) return;
+    try {
+      await api.deleteVersion(connection.id, deleteVersionTarget);
+      setVersions((current) =>
+        current.filter((version) => version.versionId !== deleteVersionTarget.versionId),
+      );
+      setDeleteVersionTarget(undefined);
+      onRefresh();
+    } catch (err) {
+      onError(errorMessage(err));
+    }
+  }
+
+  function remove() {
     onDelete();
   }
+  const rowActions: RowAction[] = [];
+  if (item.kind === "folder") {
+    rowActions.push({
+      label: "Open folder",
+      onSelect: () => onBrowse(connection, item.key),
+    });
+  }
+  if (item.kind === "file") {
+    rowActions.push(
+      {
+        label: "Download latest",
+        onSelect: () => {
+          window.open(api.fileUrl(connection.id, item.key), "_blank");
+        },
+      },
+      {
+        label: versionsOpen ? "Hide versions" : "Show versions",
+        onSelect: toggleVersions,
+      },
+    );
+  }
+  rowActions.push({
+    label: item.kind === "folder" ? "Delete folder" : "Delete file",
+    danger: true,
+    onSelect: remove,
+  });
+
+  function versionActions(version: ObjectVersion): RowAction[] {
+    const actions: RowAction[] = [];
+    if (!version.deleteMarker) {
+      actions.push({
+        label: "Download version",
+        onSelect: () => {
+          window.open(
+            api.fileUrl(connection.id, version.key, version.versionId),
+            "_blank",
+          );
+        },
+      });
+    }
+    actions.push({
+      label: "Delete version",
+      danger: true,
+      onSelect: () => setDeleteVersionTarget(version),
+    });
+    return actions;
+  }
+
   return (
-    <div
-      className="table row"
-      onClick={(event) => {
-        if (onSelectFromRow(item.key, event)) return;
-        return item.kind === "folder"
-          ? onBrowse(connection, item.key)
-          : window.open(
-              `/api/file?connection=${connection.id}&key=${encodeURIComponent(item.key)}`,
-            );
-      }}
-    >
-      <input
-        type="checkbox"
-        checked={selected}
-        onChange={() => onToggleSelected(item.key)}
-        onClick={(event) => event.stopPropagation()}
-        aria-label={`Select ${item.name}`}
-      />
-      <span>
-        {item.kind === "folder" ? <Folder size={18} /> : <File size={18} />}{" "}
-        {item.name}
-      </span>
-      <span>{item.kind}</span>
-      <span>{item.size ? `${(item.size / 1024).toFixed(1)} KB` : "—"}</span>
-      <span>
-        {(item.kind === "file" || item.kind === "folder") && (
+    <>
+      <div
+        className="table row"
+        onClick={(event) => {
+          if (onSelectFromRow(item.key, event)) return;
+          onToggleSelected(item.key);
+        }}
+        onDoubleClick={() => {
+          if (item.kind === "folder") onBrowse(connection, item.key);
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={() => onToggleSelected(item.key)}
+          onClick={(event) => event.stopPropagation()}
+          aria-label={`Select ${item.name}`}
+        />
+        <span>
+          {item.kind === "folder" ? <Folder size={18} /> : <File size={18} />} {" "}
+          {item.name}
+        </span>
+        <span>{item.kind}</span>
+        <span>{item.size ? `${(item.size / 1024).toFixed(1)} KB` : "—"}</span>
+        <span className="row-actions">
+          <RowActionMenu
+            label={`Actions for ${item.name}`}
+            actions={rowActions}
+          />
+        </span>
+      </div>
+      {item.kind === "file" && versionsOpen && (
+        <div className="version-subtable">
+          {versionsLoading ? (
+            <small>Loading object versions…</small>
+          ) : versionsError ? (
+            <p className="form-error" role="alert">
+              Unable to load versions: {versionsError}
+            </p>
+          ) : versions.length ? (
+            <>
+              <div className="version-subtable-head">
+                <span>Version</span>
+                <span>Date</span>
+                <span>Size</span>
+                <span>Status</span>
+                <span />
+              </div>
+              {versions.map((version) => (
+                <div className="version-row" key={version.versionId}>
+                  <code title={version.versionId}>
+                    {version.versionId === "null" ? "Unversioned" : version.versionId}
+                  </code>
+                  <span>{new Date(version.lastModified).toLocaleString()}</span>
+                  <span>
+                    {version.deleteMarker ? "—" : `${(version.size / 1024).toFixed(1)} KB`}
+                  </span>
+                  <span>
+                    {version.deleteMarker
+                      ? "Delete marker"
+                      : version.versionId === "null"
+                        ? "Unversioned"
+                      : version.isLatest
+                        ? "Latest"
+                        : "Previous"}
+                  </span>
+                  <RowActionMenu
+                    label={`Actions for version of ${version.key}`}
+                    actions={versionActions(version)}
+                  />
+                </div>
+              ))}
+            </>
+          ) : (
+            <small>No versions found for this object.</small>
+          )}
+        </div>
+      )}
+      {deleteVersionTarget && (
+        <DeleteVersionModal
+          version={deleteVersionTarget}
+          onCancel={() => setDeleteVersionTarget(undefined)}
+          onConfirm={confirmDeleteVersion}
+        />
+      )}
+    </>
+  );
+}
+
+function DeleteVersionModal({
+  version,
+  onCancel,
+  onConfirm,
+}: {
+  version: ObjectVersion;
+  onCancel: () => void;
+  onConfirm: () => Promise<void>;
+}) {
+  return (
+    <div className="modal-backdrop">
+      <div className="card small-modal">
+        <div className="modal-heading">
+          <div>
+            <span className="eyebrow">DELETE OBJECT VERSION</span>
+            <h2>Delete this version?</h2>
+          </div>
           <button
-            className="icon"
-            onClick={remove}
-            aria-label={`Delete ${item.name}`}
+            type="button"
+            className="modal-close"
+            onClick={onCancel}
+            aria-label="Close"
           >
-            <Trash2 size={16} />
+            ×
           </button>
-        )}
-      </span>
+        </div>
+        <div className="modal-warning">
+          <AlertTriangle size={20} aria-hidden="true" />
+          <p>
+            This permanently deletes one version of <strong>{version.key}</strong>.
+            This cannot be undone.
+          </p>
+        </div>
+        <p className="modal-description">
+          {version.deleteMarker ? "Delete marker" : version.isLatest ? "Latest version" : "Previous version"}{" "}
+          from {new Date(version.lastModified).toLocaleString()}.
+        </p>
+        <div className="modal-actions">
+          <button type="button" className="secondary" onClick={onCancel}>
+            Keep version
+          </button>
+          <button type="button" className="danger" onClick={onConfirm}>
+            <Trash2 size={15} /> Delete version
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
