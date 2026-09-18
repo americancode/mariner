@@ -179,7 +179,7 @@ func (s *Server) Router() http.Handler {
 }
 
 func (s *Server) uploadStatus(w http.ResponseWriter, r *http.Request) {
-	session, _, _, err := s.unlocked(r)
+	session, _, err := s.unlockedSession(r)
 	if err != nil {
 		fail(w, 423, err)
 		return
@@ -488,6 +488,29 @@ func (s *Server) unlocked(r *http.Request) (auth.Session, string, vault.Data, er
 	data, _, err := s.Vault.Load(session.User.ID, session.Password)
 	return session, id, data, err
 }
+
+func (s *Server) unlockedSession(r *http.Request) (auth.Session, string, error) {
+	session, id, err := s.session(r)
+	if err != nil {
+		return session, id, err
+	}
+	if session.Password == "" {
+		return session, id, errors.New("vault is locked")
+	}
+	return session, id, nil
+}
+
+func (s *Server) multipartConnection(upload vault.MultipartUpload) (vault.Connection, error) {
+	raw, err := auth.DecryptForStorage(upload.ConnectionCiphertext, s.Auth.CookieSecret)
+	if err != nil {
+		return vault.Connection{}, err
+	}
+	var connection vault.Connection
+	if err := json.Unmarshal([]byte(raw), &connection); err != nil {
+		return vault.Connection{}, err
+	}
+	return connection, nil
+}
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	session, _, ok := s.Auth.Current(r)
 	if !ok {
@@ -579,7 +602,7 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	write(w, data.Settings)
 }
 func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
-	session, _, data, err := s.unlocked(r)
+	session, _, _, err := s.unlocked(r)
 	if err != nil {
 		fail(w, 423, err)
 		return
@@ -589,8 +612,7 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, errors.New("theme must be light or dark"))
 		return
 	}
-	data.Settings = settings
-	if err = s.Vault.Save(session.User.ID, session.Password, data); err != nil {
+	if err = s.Vault.SaveSettings(session.User.ID, session.Password, settings); err != nil {
 		fail(w, 500, err)
 		return
 	}
@@ -598,7 +620,7 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	s.audit(session, "settings.update", "success", nil)
 }
 func (s *Server) addConnection(w http.ResponseWriter, r *http.Request) {
-	session, _, data, err := s.unlocked(r)
+	session, _, _, err := s.unlocked(r)
 	if err != nil {
 		fail(w, 423, err)
 		return
@@ -613,8 +635,7 @@ func (s *Server) addConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.ID = randomID()
-	data.Connections = append(data.Connections, c)
-	if err = s.Vault.Save(session.User.ID, session.Password, data); err != nil {
+	if err = s.Vault.SaveConnection(session.User.ID, session.Password, c); err != nil {
 		fail(w, 500, err)
 		return
 	}
@@ -694,8 +715,7 @@ func (s *Server) updateConnection(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusBadRequest, fmt.Errorf("connection test failed: %w", err))
 			return
 		}
-		data.Connections[i] = update
-		if err = s.Vault.Save(session.User.ID, session.Password, data); err != nil {
+		if err = s.Vault.SaveConnection(session.User.ID, session.Password, update); err != nil {
 			fail(w, 500, err)
 			return
 		}
@@ -716,13 +736,17 @@ func (s *Server) deleteConnection(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusForbidden, errors.New("organization connections cannot be deleted"))
 		return
 	}
-	for i, c := range data.Connections {
+	found := false
+	for _, c := range data.Connections {
 		if c.ID == id {
-			data.Connections = append(data.Connections[:i], data.Connections[i+1:]...)
+			found = true
 			break
 		}
 	}
-	if err = s.Vault.Save(session.User.ID, session.Password, data); err != nil {
+	if found {
+		err = s.Vault.DeleteConnection(session.User.ID, session.Password, id)
+	}
+	if err != nil {
 		fail(w, 500, err)
 		return
 	}
@@ -1108,7 +1132,7 @@ func (s *Server) uploadInit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
-	session, _, data, err := s.unlocked(r)
+	session, _, err := s.unlockedSession(r)
 	if err != nil {
 		fail(w, 423, err)
 		return
@@ -1133,18 +1157,14 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, errors.New("multipart parts must be uploaded in order"))
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, multipartPartSize+1))
-	if err != nil {
-		fail(w, http.StatusBadRequest, err)
-		return
-	}
-	if int64(len(body)) > multipartPartSize {
+	bodySize := r.ContentLength
+	if bodySize > multipartPartSize {
 		fail(w, http.StatusRequestEntityTooLarge, errors.New("upload part is too large"))
 		return
 	}
-	c, err := s.connectionValue(r.URL.Query().Get("connection"), data, session.User)
+	c, err := s.multipartConnection(record)
 	if err != nil {
-		fail(w, http.StatusNotFound, err)
+		fail(w, http.StatusInternalServerError, err)
 		return
 	}
 	client, err := s3client.New(r.Context(), c)
@@ -1152,30 +1172,38 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err)
 		return
 	}
-	part, err := client.UploadPart(r.Context(), &s3.UploadPartInput{Bucket: aws.String(record.Bucket), Key: aws.String(record.Key), UploadId: aws.String(uploadID), PartNumber: aws.Int32(int32(partNumber)), Body: bytes.NewReader(body), ContentLength: aws.Int64(int64(len(body)))})
-	if err != nil {
-		fail(w, http.StatusBadGateway, err)
-		return
-	}
-	parts := []types.CompletedPart{}
-	if err := json.Unmarshal([]byte(record.PartsJSON), &parts); err != nil {
-		fail(w, 500, err)
-		return
-	}
-	parts = append(parts, types.CompletedPart{ETag: part.ETag, PartNumber: aws.Int32(int32(partNumber))})
 	hasher, err := unmarshalHash(record.HashState)
 	if err != nil {
 		fail(w, 500, err)
 		return
 	}
-	_, _ = hasher.Write(body)
+	var body io.Reader
+	if bodySize >= 0 {
+		body = io.TeeReader(r.Body, hasher)
+	} else {
+		buffered, readErr := io.ReadAll(io.LimitReader(r.Body, multipartPartSize+1))
+		if readErr != nil {
+			fail(w, http.StatusBadRequest, readErr)
+			return
+		}
+		if int64(len(buffered)) > multipartPartSize {
+			fail(w, http.StatusRequestEntityTooLarge, errors.New("upload part is too large"))
+			return
+		}
+		bodySize = int64(len(buffered))
+		body = io.TeeReader(bytes.NewReader(buffered), hasher)
+	}
+	part, err := client.UploadPart(r.Context(), &s3.UploadPartInput{Bucket: aws.String(record.Bucket), Key: aws.String(record.Key), UploadId: aws.String(uploadID), PartNumber: aws.Int32(int32(partNumber)), Body: body, ContentLength: aws.Int64(bodySize)})
+	if err != nil {
+		fail(w, http.StatusBadGateway, err)
+		return
+	}
 	hashState, err := marshalHash(hasher)
 	if err != nil {
 		fail(w, 500, err)
 		return
 	}
-	partsJSON, _ := json.Marshal(parts)
-	updated, err := s.Vault.SaveMultipartPart(uploadID, int32(partNumber), string(partsJSON), hashState)
+	updated, err := s.Vault.SaveMultipartPart(uploadID, int32(partNumber), aws.ToString(part.ETag), bodySize, hashState)
 	if err != nil {
 		log.Printf("multipart state part advance failed upload=%s part=%d error=%v", uploadID, partNumber, err)
 		fail(w, 500, err)
@@ -1189,7 +1217,7 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
-	session, _, data, err := s.unlocked(r)
+	session, _, err := s.unlockedSession(r)
 	if err != nil {
 		fail(w, 423, err)
 		return
@@ -1219,12 +1247,12 @@ func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, errors.New("multipart upload not found or empty"))
 		return
 	}
-	c, err := s.connectionValue(r.URL.Query().Get("connection"), data, session.User)
+	c, err := s.multipartConnection(state)
 	if err != nil {
 		if finishErr := s.Vault.FinishMultipartUpload(uploadID, false); finishErr != nil {
 			log.Printf("multipart state finish failed upload=%s success=false error=%v", uploadID, finishErr)
 		}
-		fail(w, http.StatusNotFound, err)
+		fail(w, http.StatusInternalServerError, err)
 		return
 	}
 	client, err := s3client.New(r.Context(), c)
@@ -1235,13 +1263,17 @@ func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err)
 		return
 	}
-	var parts []types.CompletedPart
-	if err = json.Unmarshal([]byte(state.PartsJSON), &parts); err != nil {
+	storedParts, err := s.Vault.ListMultipartParts(uploadID)
+	if err != nil {
 		if finishErr := s.Vault.FinishMultipartUpload(uploadID, false); finishErr != nil {
 			log.Printf("multipart state finish failed upload=%s success=false error=%v", uploadID, finishErr)
 		}
 		fail(w, 500, err)
 		return
+	}
+	parts := make([]types.CompletedPart, 0, len(storedParts))
+	for _, storedPart := range storedParts {
+		parts = append(parts, types.CompletedPart{ETag: aws.String(storedPart.ETag), PartNumber: aws.Int32(storedPart.PartNumber)})
 	}
 	_, err = client.CompleteMultipartUpload(r.Context(), &s3.CompleteMultipartUploadInput{Bucket: aws.String(state.Bucket), Key: aws.String(state.Key), UploadId: aws.String(uploadID), MultipartUpload: &types.CompletedMultipartUpload{Parts: parts}})
 	if err != nil {
@@ -1268,7 +1300,7 @@ func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) uploadAbort(w http.ResponseWriter, r *http.Request) {
-	session, _, data, err := s.unlocked(r)
+	session, _, err := s.unlockedSession(r)
 	if err != nil {
 		fail(w, 423, err)
 		return
@@ -1284,9 +1316,9 @@ func (s *Server) uploadAbort(w http.ResponseWriter, r *http.Request) {
 		write(w, map[string]bool{"ok": true})
 		return
 	}
-	c, err := s.connectionValue(state.ConnectionID, data, session.User)
+	c, err := s.multipartConnection(state)
 	if err != nil {
-		fail(w, http.StatusNotFound, err)
+		fail(w, http.StatusInternalServerError, err)
 		return
 	}
 	client, err := s3client.New(r.Context(), c)

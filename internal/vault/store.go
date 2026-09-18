@@ -97,6 +97,12 @@ type MultipartUpload struct {
 	ConnectionCiphertext                                string
 }
 
+type MultipartPart struct {
+	PartNumber int32
+	ETag       string
+	Size       int64
+}
+
 func (s *Store) AuditCursor() (string, string, error) {
 	var occurredAt, eventID string
 	err := s.db.QueryRowx("SELECT occurred_at, event_id FROM audit_events ORDER BY occurred_at DESC, event_id DESC LIMIT 1").Scan(&occurredAt, &eventID)
@@ -177,11 +183,17 @@ func Open(dir string) (*Store, error) {
 func (s *Store) migrate() error {
 	for _, statement := range []string{
 		`CREATE TABLE IF NOT EXISTS vaults (user_id TEXT PRIMARY KEY, salt TEXT NOT NULL, nonce TEXT NOT NULL, ciphertext TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS vault_metadata (user_id TEXT PRIMARY KEY, salt TEXT NOT NULL, verifier_nonce TEXT NOT NULL, verifier_ciphertext TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS vault_connections (user_id TEXT NOT NULL, connection_id TEXT NOT NULL, nonce TEXT NOT NULL, ciphertext TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id, connection_id))`,
+		`CREATE INDEX IF NOT EXISTS vault_connections_user_idx ON vault_connections(user_id, connection_id)`,
+		`CREATE TABLE IF NOT EXISTS vault_settings (user_id TEXT PRIMARY KEY, nonce TEXT NOT NULL, ciphertext TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS audit_events (event_id TEXT PRIMARY KEY, occurred_at TEXT NOT NULL, event_json TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS organizations (id TEXT PRIMARY KEY, encrypted TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS user_preferences (user_id TEXT PRIMARY KEY, settings_json TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, user_name TEXT NOT NULL, groups_json TEXT NOT NULL, password_ciphertext TEXT NOT NULL, expires_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS multipart_uploads (upload_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, connection_id TEXT NOT NULL, bucket TEXT NOT NULL, object_key TEXT NOT NULL, status TEXT NOT NULL, next_part INTEGER NOT NULL, parts_json TEXT NOT NULL, hash_state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS multipart_parts (upload_id TEXT NOT NULL, part_number INTEGER NOT NULL, etag TEXT NOT NULL, size INTEGER NOT NULL, PRIMARY KEY(upload_id, part_number))`,
+		`CREATE INDEX IF NOT EXISTS multipart_parts_upload_idx ON multipart_parts(upload_id, part_number)`,
 	} {
 		if _, err := s.writeDB.Exec(statement); err != nil {
 			return err
@@ -191,6 +203,47 @@ func (s *Store) migrate() error {
 		message := strings.ToLower(err.Error())
 		if !strings.Contains(message, "duplicate") && !strings.Contains(message, "already exists") {
 			return err
+		}
+	}
+	return s.migrateMultipartParts()
+}
+
+func (s *Store) migrateMultipartParts() error {
+	type legacyUpload struct {
+		ID, PartsJSON string
+	}
+	type legacyPart struct {
+		ETag       *string `json:"ETag"`
+		PartNumber *int32  `json:"PartNumber"`
+	}
+	rows, err := s.db.Queryx(`SELECT upload_id,parts_json FROM multipart_uploads WHERE parts_json <> '[]'`)
+	if err != nil {
+		return err
+	}
+	var uploads []legacyUpload
+	for rows.Next() {
+		var upload legacyUpload
+		if err := rows.Scan(&upload.ID, &upload.PartsJSON); err != nil {
+			rows.Close()
+			return err
+		}
+		uploads = append(uploads, upload)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, upload := range uploads {
+		var parts []legacyPart
+		if err := json.Unmarshal([]byte(upload.PartsJSON), &parts); err != nil {
+			return err
+		}
+		for _, part := range parts {
+			if part.ETag == nil || part.PartNumber == nil {
+				return errors.New("invalid legacy multipart part state")
+			}
+			if _, err := s.writeDB.Exec(s.writeDB.Rebind(`INSERT INTO multipart_parts(upload_id,part_number,etag,size) VALUES(?,?,?,0) ON CONFLICT(upload_id,part_number) DO NOTHING`), upload.ID, *part.PartNumber, *part.ETag); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -271,13 +324,41 @@ func (s *Store) ClaimMultipartCleanup(id string, before time.Time) (bool, error)
 	return n == 1, err
 }
 
-func (s *Store) SaveMultipartPart(id string, expectedPart int32, partsJSON, hashState string) (bool, error) {
-	result, err := s.writeDB.Exec(s.writeDB.Rebind(`UPDATE multipart_uploads SET next_part=next_part+1,parts_json=?,hash_state=?,updated_at=? WHERE upload_id=? AND status='active' AND next_part=?`), partsJSON, hashState, time.Now().UTC().Format(time.RFC3339Nano), id, expectedPart)
+func (s *Store) SaveMultipartPart(id string, expectedPart int32, etag string, size int64, hashState string) (bool, error) {
+	tx, err := s.writeDB.Beginx()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(tx.Rebind(`UPDATE multipart_uploads SET next_part=next_part+1,hash_state=?,updated_at=? WHERE upload_id=? AND status='active' AND next_part=?`), hashState, time.Now().UTC().Format(time.RFC3339Nano), id, expectedPart)
 	if err != nil {
 		return false, err
 	}
 	n, err := result.RowsAffected()
-	return n == 1, err
+	if err != nil || n != 1 {
+		return false, err
+	}
+	if _, err = tx.Exec(tx.Rebind(`INSERT INTO multipart_parts(upload_id,part_number,etag,size) VALUES(?,?,?,?)`), id, expectedPart, etag, size); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func (s *Store) ListMultipartParts(id string) ([]MultipartPart, error) {
+	rows, err := s.db.Queryx(s.db.Rebind(`SELECT part_number,etag,size FROM multipart_parts WHERE upload_id=? ORDER BY part_number`), id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	parts := []MultipartPart{}
+	for rows.Next() {
+		var part MultipartPart
+		if err := rows.Scan(&part.PartNumber, &part.ETag, &part.Size); err != nil {
+			return nil, err
+		}
+		parts = append(parts, part)
+	}
+	return parts, rows.Err()
 }
 
 func (s *Store) ClaimMultipartComplete(id string) (MultipartUpload, bool, error) {
@@ -293,17 +374,26 @@ func (s *Store) ClaimMultipartComplete(id string) (MultipartUpload, bool, error)
 }
 
 func (s *Store) FinishMultipartUpload(id string, success bool) error {
-	status := "active"
 	if success {
-		status = "complete"
+		return s.DeleteMultipartUpload(id)
 	}
-	_, err := s.writeDB.Exec(s.writeDB.Rebind(`UPDATE multipart_uploads SET status=?,updated_at=? WHERE upload_id=? AND status='completing'`), status, time.Now().UTC().Format(time.RFC3339Nano), id)
+	_, err := s.writeDB.Exec(s.writeDB.Rebind(`UPDATE multipart_uploads SET status='active',updated_at=? WHERE upload_id=? AND status='completing'`), time.Now().UTC().Format(time.RFC3339Nano), id)
 	return err
 }
 
 func (s *Store) DeleteMultipartUpload(id string) error {
-	_, err := s.writeDB.Exec(s.writeDB.Rebind(`DELETE FROM multipart_uploads WHERE upload_id=?`), id)
-	return err
+	tx, err := s.writeDB.Beginx()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(tx.Rebind(`DELETE FROM multipart_parts WHERE upload_id=?`), id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(tx.Rebind(`DELETE FROM multipart_uploads WHERE upload_id=?`), id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) GetUserPreferences(userID string) (map[string]bool, error) {
 	var raw string
@@ -424,36 +514,311 @@ func decryptOrganization(encoded, key string, target *Organization) error {
 }
 func (s *Store) Exists(userID string) (bool, error) {
 	var count int
-	err := s.db.Get(&count, s.db.Rebind("SELECT count(*) FROM vaults WHERE user_id = ?"), userID)
+	err := s.db.Get(&count, s.db.Rebind("SELECT (SELECT count(*) FROM vault_metadata WHERE user_id = ?) + (SELECT count(*) FROM vaults WHERE user_id = ?)"), userID, userID)
 	return count > 0, err
 }
 func (s *Store) Load(userID, password string) (Data, bool, error) {
+	data, found, err := s.loadNormalizedVault(userID, password)
+	if err != nil || found {
+		return data, found, err
+	}
 	var e envelope
-	err := s.db.QueryRowx(s.db.Rebind("SELECT salt, nonce, ciphertext FROM vaults WHERE user_id = ?"), userID).Scan(&e.Salt, &e.Nonce, &e.Ciphertext)
+	err = s.db.QueryRowx(s.db.Rebind("SELECT salt, nonce, ciphertext FROM vaults WHERE user_id = ?"), userID).Scan(&e.Salt, &e.Nonce, &e.Ciphertext)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Data{}, false, nil
 	}
 	if err != nil {
 		return Data{}, false, err
 	}
-	data, err := decrypt(e, password)
-	return data, true, err
+	data, err = decrypt(e, password)
+	if err != nil {
+		return Data{}, true, err
+	}
+	// Legacy whole-vault envelopes migrate only after the supplied password has
+	// authenticated successfully. The old row is deleted in the same transaction
+	// that writes the normalized replacement.
+	if err := s.saveNormalizedVault(userID, password, data, true); err != nil {
+		return Data{}, true, err
+	}
+	return data, true, nil
 }
 func (s *Store) Save(userID, password string, data Data) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, err := encrypt(data, password)
+	return s.saveNormalizedVault(userID, password, data, true)
+}
+
+const vaultVerifier = "mariner-normalized-vault-v1"
+
+type sealedValue struct {
+	Nonce, Ciphertext string
+}
+
+func vaultCipher(password, encodedSalt string) (cipher.AEAD, error) {
+	salt, err := base64.RawStdEncoding.DecodeString(encodedSalt)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key(password, salt))
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+func sealValue(gcm cipher.AEAD, raw, associatedData []byte) (sealedValue, error) {
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return sealedValue{}, err
+	}
+	return sealedValue{
+		Nonce:      base64.RawStdEncoding.EncodeToString(nonce),
+		Ciphertext: base64.RawStdEncoding.EncodeToString(gcm.Seal(nil, nonce, raw, associatedData)),
+	}, nil
+}
+
+func openValue(gcm cipher.AEAD, sealed sealedValue, associatedData []byte) ([]byte, error) {
+	nonce, err := base64.RawStdEncoding.DecodeString(sealed.Nonce)
+	if err != nil {
+		return nil, err
+	}
+	ciphertext, err := base64.RawStdEncoding.DecodeString(sealed.Ciphertext)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := gcm.Open(nil, nonce, ciphertext, associatedData)
+	if err != nil {
+		return nil, errors.New("incorrect master password")
+	}
+	return raw, nil
+}
+
+func vaultAAD(userID, entity string) []byte { return []byte(userID + "\x00" + entity) }
+
+func (s *Store) loadNormalizedVault(userID, password string) (Data, bool, error) {
+	var salt string
+	var verifier sealedValue
+	err := s.db.QueryRowx(s.db.Rebind(`SELECT salt,verifier_nonce,verifier_ciphertext FROM vault_metadata WHERE user_id=?`), userID).Scan(&salt, &verifier.Nonce, &verifier.Ciphertext)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Data{}, false, nil
+	}
+	if err != nil {
+		return Data{}, false, err
+	}
+	gcm, err := vaultCipher(password, salt)
+	if err != nil {
+		return Data{}, true, err
+	}
+	verified, err := openValue(gcm, verifier, vaultAAD(userID, "verifier"))
+	if err != nil || string(verified) != vaultVerifier {
+		return Data{}, true, errors.New("incorrect master password")
+	}
+	data := Data{Connections: []Connection{}}
+	rows, err := s.db.Queryx(s.db.Rebind(`SELECT connection_id,nonce,ciphertext FROM vault_connections WHERE user_id=? ORDER BY connection_id`), userID)
+	if err != nil {
+		return Data{}, true, err
+	}
+	for rows.Next() {
+		var id string
+		var sealed sealedValue
+		if err := rows.Scan(&id, &sealed.Nonce, &sealed.Ciphertext); err != nil {
+			rows.Close()
+			return Data{}, true, err
+		}
+		raw, err := openValue(gcm, sealed, vaultAAD(userID, "connection:"+id))
+		if err != nil {
+			rows.Close()
+			return Data{}, true, err
+		}
+		var connection Connection
+		if err := json.Unmarshal(raw, &connection); err != nil {
+			rows.Close()
+			return Data{}, true, err
+		}
+		if connection.ID != id {
+			rows.Close()
+			return Data{}, true, errors.New("encrypted connection identity mismatch")
+		}
+		data.Connections = append(data.Connections, connection)
+	}
+	if err := rows.Close(); err != nil {
+		return Data{}, true, err
+	}
+	var settings sealedValue
+	err = s.db.QueryRowx(s.db.Rebind(`SELECT nonce,ciphertext FROM vault_settings WHERE user_id=?`), userID).Scan(&settings.Nonce, &settings.Ciphertext)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return Data{}, true, err
+	}
+	if err == nil {
+		raw, err := openValue(gcm, settings, vaultAAD(userID, "settings"))
+		if err != nil {
+			return Data{}, true, err
+		}
+		if err := json.Unmarshal(raw, &data.Settings); err != nil {
+			return Data{}, true, err
+		}
+	}
+	return data, true, nil
+}
+
+func (s *Store) saveNormalizedVault(userID, password string, data Data, deleteLegacy bool) error {
+	var salt string
+	var currentVerifier sealedValue
+	err := s.db.QueryRowx(s.db.Rebind(`SELECT salt,verifier_nonce,verifier_ciphertext FROM vault_metadata WHERE user_id=?`), userID).Scan(&salt, &currentVerifier.Nonce, &currentVerifier.Ciphertext)
+	if errors.Is(err, sql.ErrNoRows) {
+		rawSalt := make([]byte, 16)
+		if _, err := rand.Read(rawSalt); err != nil {
+			return err
+		}
+		salt = base64.RawStdEncoding.EncodeToString(rawSalt)
+	} else if err != nil {
+		return err
+	}
+	gcm, err := vaultCipher(password, salt)
 	if err != nil {
 		return err
 	}
-	_, err = s.writeDB.Exec(s.writeDB.Rebind(`INSERT INTO vaults(user_id,salt,nonce,ciphertext,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET salt=excluded.salt,nonce=excluded.nonce,ciphertext=excluded.ciphertext,updated_at=excluded.updated_at`), userID, e.Salt, e.Nonce, e.Ciphertext, time.Now().UTC().Format(time.RFC3339))
+	if currentVerifier.Ciphertext != "" {
+		verified, err := openValue(gcm, currentVerifier, vaultAAD(userID, "verifier"))
+		if err != nil || string(verified) != vaultVerifier {
+			return errors.New("incorrect master password")
+		}
+	}
+	verifier, err := sealValue(gcm, []byte(vaultVerifier), vaultAAD(userID, "verifier"))
+	if err != nil {
+		return err
+	}
+	settingsRaw, err := json.Marshal(data.Settings)
+	if err != nil {
+		return err
+	}
+	settings, err := sealValue(gcm, settingsRaw, vaultAAD(userID, "settings"))
+	if err != nil {
+		return err
+	}
+	type encryptedConnection struct {
+		id     string
+		sealed sealedValue
+	}
+	encryptedConnections := make([]encryptedConnection, 0, len(data.Connections))
+	for _, connection := range data.Connections {
+		if connection.ID == "" {
+			return errors.New("connection id is required")
+		}
+		raw, err := json.Marshal(connection)
+		if err != nil {
+			return err
+		}
+		sealed, err := sealValue(gcm, raw, vaultAAD(userID, "connection:"+connection.ID))
+		if err != nil {
+			return err
+		}
+		encryptedConnections = append(encryptedConnections, encryptedConnection{id: connection.ID, sealed: sealed})
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.writeDB.Beginx()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(tx.Rebind(`INSERT INTO vault_metadata(user_id,salt,verifier_nonce,verifier_ciphertext,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET salt=excluded.salt,verifier_nonce=excluded.verifier_nonce,verifier_ciphertext=excluded.verifier_ciphertext,updated_at=excluded.updated_at`), userID, salt, verifier.Nonce, verifier.Ciphertext, now); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(tx.Rebind(`DELETE FROM vault_connections WHERE user_id=?`), userID); err != nil {
+		return err
+	}
+	for _, connection := range encryptedConnections {
+		if _, err = tx.Exec(tx.Rebind(`INSERT INTO vault_connections(user_id,connection_id,nonce,ciphertext,updated_at) VALUES(?,?,?,?,?)`), userID, connection.id, connection.sealed.Nonce, connection.sealed.Ciphertext, now); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.Exec(tx.Rebind(`INSERT INTO vault_settings(user_id,nonce,ciphertext,updated_at) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET nonce=excluded.nonce,ciphertext=excluded.ciphertext,updated_at=excluded.updated_at`), userID, settings.Nonce, settings.Ciphertext, now); err != nil {
+		return err
+	}
+	if deleteLegacy {
+		if _, err = tx.Exec(tx.Rebind(`DELETE FROM vaults WHERE user_id=?`), userID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) authenticatedVaultCipher(userID, password string) (cipher.AEAD, error) {
+	var salt string
+	var verifier sealedValue
+	if err := s.db.QueryRowx(s.db.Rebind(`SELECT salt,verifier_nonce,verifier_ciphertext FROM vault_metadata WHERE user_id=?`), userID).Scan(&salt, &verifier.Nonce, &verifier.Ciphertext); err != nil {
+		return nil, err
+	}
+	gcm, err := vaultCipher(password, salt)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := openValue(gcm, verifier, vaultAAD(userID, "verifier"))
+	if err != nil || string(raw) != vaultVerifier {
+		return nil, errors.New("incorrect master password")
+	}
+	return gcm, nil
+}
+
+func (s *Store) SaveConnection(userID, password string, connection Connection) error {
+	if connection.ID == "" {
+		return errors.New("connection id is required")
+	}
+	gcm, err := s.authenticatedVaultCipher(userID, password)
+	if err != nil {
+		return err
+	}
+	raw, err := json.Marshal(connection)
+	if err != nil {
+		return err
+	}
+	sealed, err := sealValue(gcm, raw, vaultAAD(userID, "connection:"+connection.ID))
+	if err != nil {
+		return err
+	}
+	_, err = s.writeDB.Exec(s.writeDB.Rebind(`INSERT INTO vault_connections(user_id,connection_id,nonce,ciphertext,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id,connection_id) DO UPDATE SET nonce=excluded.nonce,ciphertext=excluded.ciphertext,updated_at=excluded.updated_at`), userID, connection.ID, sealed.Nonce, sealed.Ciphertext, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
+
+func (s *Store) DeleteConnection(userID, password, connectionID string) error {
+	if _, err := s.authenticatedVaultCipher(userID, password); err != nil {
+		return err
+	}
+	_, err := s.writeDB.Exec(s.writeDB.Rebind(`DELETE FROM vault_connections WHERE user_id=? AND connection_id=?`), userID, connectionID)
+	return err
+}
+
+func (s *Store) SaveSettings(userID, password string, settings Settings) error {
+	gcm, err := s.authenticatedVaultCipher(userID, password)
+	if err != nil {
+		return err
+	}
+	raw, err := json.Marshal(settings)
+	if err != nil {
+		return err
+	}
+	sealed, err := sealValue(gcm, raw, vaultAAD(userID, "settings"))
+	if err != nil {
+		return err
+	}
+	_, err = s.writeDB.Exec(s.writeDB.Rebind(`INSERT INTO vault_settings(user_id,nonce,ciphertext,updated_at) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET nonce=excluded.nonce,ciphertext=excluded.ciphertext,updated_at=excluded.updated_at`), userID, sealed.Nonce, sealed.Ciphertext, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
 func (s *Store) Delete(userID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.writeDB.Exec(s.writeDB.Rebind("DELETE FROM vaults WHERE user_id = ?"), userID)
-	return err
+	tx, err := s.writeDB.Beginx()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, table := range []string{"vault_connections", "vault_settings", "vault_metadata", "vaults"} {
+		if _, err := tx.Exec(tx.Rebind("DELETE FROM "+table+" WHERE user_id = ?"), userID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 func (s *Store) AppendAudit(event AuditEvent) (string, error) {
 	raw, err := json.Marshal(event)

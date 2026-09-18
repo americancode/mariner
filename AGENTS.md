@@ -113,7 +113,17 @@ The Helm chart supports `oidc.groupsClaim`, `organizations`, and `extraObjects`.
 The chart defaults to PostgreSQL. SQLite is available for lightweight
 single-replica use with `database.driver: sqlite`. PostgreSQL may use `DATABASE_URL` or the chart's
 field-based `database.existingSecret` selectors. Both backends use the same encrypted vault
-envelope schema and the same `audit_events.event_json` JSON content.
+schema and the same `audit_events.event_json` JSON content.
+
+Persistent domain collections must use normalized relational rows in both
+SQLite and PostgreSQL. Do not store growing collections such as multipart
+parts, connections, sessions, or work queues in a JSON column and rewrite the
+whole document as individual items change. JSON is reserved for immutable
+event payloads and bounded configuration metadata. An authenticated encrypted
+payload representing one entity is acceptable when its contents must remain
+opaque to the database, but each entity must still have its own row and stable
+relational identity. Schema and query designs must keep per-item writes
+constant-size and must be concurrency-tested on both database backends.
 Unlocked HTTP sessions expire after the configured idle timeout, controlled by
 the Helm `sessionIdleTimeout` value (emitted as `SESSION_IDLE_TIMEOUT`, default
 `30m`), with the server enforcing the timeout from shared SQL state.

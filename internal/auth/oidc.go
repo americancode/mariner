@@ -56,6 +56,7 @@ type Service struct {
 	sessions                map[string]Session // retained only for tests/standalone use
 	mu                      sync.RWMutex
 	touchMu                 sync.Mutex
+	lastTouches             map[string]time.Time
 }
 
 const sessionTouchInterval = 30 * time.Second
@@ -82,7 +83,7 @@ func New(issuer, clientID, clientSecret, redirect, cookieSecret, groupsClaim, au
 	if err != nil {
 		return nil, fmt.Errorf("OIDC discovery request failed: %w", err)
 	}
-	return &Service{Provider: provider, OAuth: &oauth2.Config{ClientID: clientID, ClientSecret: clientSecret, Endpoint: provider.Endpoint(), RedirectURL: redirect, Scopes: scopes}, CookieSecret: cookieSecret, GroupsClaim: groupsClaim, AudienceClaim: audienceClaim, Audience: audience, NameClaim: nameClaim, DebugJWT: debugJWT, LogoutEnabled: logoutEnabled, LogoutEndpoint: logoutEndpoint, sessions: map[string]Session{}}, nil
+	return &Service{Provider: provider, OAuth: &oauth2.Config{ClientID: clientID, ClientSecret: clientSecret, Endpoint: provider.Endpoint(), RedirectURL: redirect, Scopes: scopes}, CookieSecret: cookieSecret, GroupsClaim: groupsClaim, AudienceClaim: audienceClaim, Audience: audience, NameClaim: nameClaim, DebugJWT: debugJWT, LogoutEnabled: logoutEnabled, LogoutEndpoint: logoutEndpoint, sessions: map[string]Session{}, lastTouches: map[string]time.Time{}}, nil
 }
 
 func discoverLogoutEndpoint(client *http.Client, issuer string) (string, error) {
@@ -219,16 +220,28 @@ func (s *Service) Current(r *http.Request) (Session, string, bool) {
 				log.Printf("auth session expired session_ref=%s reason=%s", sessionRef(id), sessionExpiryReason(now, expires, lastSeen, s.SessionIdleTimeout))
 				_ = s.sessionStore.DeleteSession(id)
 			}
+			s.touchMu.Lock()
+			delete(s.lastTouches, id)
+			s.touchMu.Unlock()
 			return Session{}, id, false
 		}
-		// Session validation remains read-first. Only one request in this
-		// process refreshes a stale session timestamp at a time, and the SQL
-		// predicate makes the update safe across replicas.
-		s.touchMu.Lock()
-		err = s.sessionStore.TouchSessionIfStale(id, now, now.Add(-sessionTouchInterval))
-		s.touchMu.Unlock()
-		if err != nil {
-			log.Printf("auth session touch failed session_ref=%s error=%v", sessionRef(id), err)
+		// A fresh session is read-only. This local gate prevents a burst of
+		// concurrent requests from each attempting the same conditional SQL
+		// update after the shared timestamp becomes stale.
+		if now.Sub(lastSeen) >= sessionTouchInterval {
+			s.touchMu.Lock()
+			lastTouch := s.lastTouches[id]
+			if now.Sub(lastTouch) >= sessionTouchInterval {
+				s.lastTouches[id] = now
+				err = s.sessionStore.TouchSessionIfStale(id, now, now.Add(-sessionTouchInterval))
+				if err != nil {
+					delete(s.lastTouches, id)
+				}
+			}
+			s.touchMu.Unlock()
+			if err != nil {
+				log.Printf("auth session touch failed session_ref=%s error=%v", sessionRef(id), err)
+			}
 		}
 		groups := []string{}
 		if json.Unmarshal([]byte(groupsJSON), &groups) != nil {
@@ -280,6 +293,9 @@ func (s *Service) Logout(w http.ResponseWriter, r *http.Request) {
 	id := s.cookie(r, "mariner_session")
 	if s.sessionStore != nil {
 		_ = s.sessionStore.DeleteSession(id)
+		s.touchMu.Lock()
+		delete(s.lastTouches, id)
+		s.touchMu.Unlock()
 	} else {
 		s.mu.Lock()
 		delete(s.sessions, id)

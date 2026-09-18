@@ -1,6 +1,12 @@
 package auth
 
-import "testing"
+import (
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 func TestSessionSecretEncryptionRoundTrip(t *testing.T) {
 	encoded := encryptSessionSecret("master-password", "cookie-secret")
@@ -41,5 +47,53 @@ func TestSafeReturnPath(t *testing.T) {
 		if got := safeReturnPath(test.input); got != test.expected {
 			t.Errorf("safeReturnPath(%q) = %q, want %q", test.input, got, test.expected)
 		}
+	}
+}
+
+type countingSessionStore struct {
+	touches atomic.Int32
+	seen    time.Time
+}
+
+func (s *countingSessionStore) SaveSession(string, string, string, string, string, time.Time) error {
+	return nil
+}
+func (s *countingSessionStore) LoadSession(string) (string, string, string, string, time.Time, time.Time, bool, error) {
+	return "user-1", "Demo", `[]`, "", time.Now().Add(time.Hour), s.seen, true, nil
+}
+func (s *countingSessionStore) DeleteSession(string) error { return nil }
+func (s *countingSessionStore) TouchSessionIfStale(string, time.Time, time.Time) error {
+	s.touches.Add(1)
+	return nil
+}
+
+func TestConcurrentRequestsTouchSharedSessionOnce(t *testing.T) {
+	store := &countingSessionStore{seen: time.Now().Add(-time.Minute)}
+	service := &Service{
+		CookieSecret:       "test-secret",
+		SessionIdleTimeout: time.Hour,
+		sessionStore:       store,
+		sessions:           map[string]Session{},
+		lastTouches:        map[string]time.Time{},
+	}
+	recorder := httptest.NewRecorder()
+	service.setCookie(recorder, "mariner_session", "session-1", 60)
+	cookie := recorder.Result().Cookies()[0]
+	const requests = 64
+	var wg sync.WaitGroup
+	for range requests {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := httptest.NewRequest("GET", "/api/me", nil)
+			r.AddCookie(cookie)
+			if _, _, ok := service.Current(r); !ok {
+				t.Error("expected valid session")
+			}
+		}()
+	}
+	wg.Wait()
+	if got := store.touches.Load(); got != 1 {
+		t.Fatalf("concurrent requests performed %d session writes, want 1", got)
 	}
 }
