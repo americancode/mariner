@@ -56,6 +56,7 @@ type Activity = {
   progress: number;
   state: "active" | "done" | "error";
   error?: string;
+  finishedAt?: number;
 };
 type ActivitySetter = React.Dispatch<React.SetStateAction<Activity[]>>;
 const auditColumns = [
@@ -689,6 +690,21 @@ function Workspace({
   onFilterChange: (kind: BrowseKind) => void;
 }) {
   const [activities, setActivities] = useState<Activity[]>([]);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      setActivities((current) => {
+        const next = current.filter((activity) => {
+          if (activity.state === "active" || !activity.finishedAt) return true;
+          const lifetime = activity.state === "done" ? 30_000 : 60_000;
+          return now - activity.finishedAt < lifetime;
+        });
+        return next.length === current.length ? current : next;
+      });
+    }, 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   return (
     <main className="content">
       <header>
@@ -1181,14 +1197,16 @@ function Explorer({
       URL.revokeObjectURL(url);
       setActivities((current) =>
         current.map((item) =>
-          item.id === id ? { ...item, progress: 100, state: "done" } : item,
+          item.id === id
+            ? { ...item, progress: 100, state: "done", finishedAt: Date.now() }
+            : item,
         ),
       );
     } catch (err) {
       setActivities((current) =>
         current.map((item) =>
           item.id === id
-            ? { ...item, state: "error", error: errorMessage(err) }
+            ? { ...item, state: "error", error: errorMessage(err), finishedAt: Date.now() }
             : item,
         ),
       );
@@ -1259,7 +1277,7 @@ function Explorer({
           setActivities((current) =>
             current.map((activity) =>
               activity.id === id
-                ? { ...activity, progress: 100, state: "done" }
+                ? { ...activity, progress: 100, state: "done", finishedAt: Date.now() }
                 : activity,
             ),
           );
@@ -1267,7 +1285,7 @@ function Explorer({
           setActivities((current) =>
             current.map((activity) =>
               activity.id === id
-                ? { ...activity, state: "error", error: errorMessage(err) }
+                ? { ...activity, state: "error", error: errorMessage(err), finishedAt: Date.now() }
                 : activity,
             ),
           );
@@ -1306,14 +1324,16 @@ function Explorer({
           );
           setActivities((current) =>
             current.map((item) =>
-              item.id === id ? { ...item, progress: 100, state: "done" } : item,
+              item.id === id
+                ? { ...item, progress: 100, state: "done", finishedAt: Date.now() }
+                : item,
             ),
           );
         } catch (err) {
           setActivities((current) =>
             current.map((item) =>
               item.id === id
-                ? { ...item, state: "error", error: errorMessage(err) }
+                ? { ...item, state: "error", error: errorMessage(err), finishedAt: Date.now() }
                 : item,
             ),
           );
@@ -1489,7 +1509,7 @@ function Explorer({
               setActivities((current) =>
                 current.map((item) =>
                   item.id === id
-                    ? { ...item, progress: 100, state: "done" }
+                    ? { ...item, progress: 100, state: "done", finishedAt: Date.now() }
                     : item,
                 ),
               );
@@ -1498,7 +1518,7 @@ function Explorer({
               setActivities((current) =>
                 current.map((item) =>
                   item.id === id
-                    ? { ...item, state: "error", error: errorMessage(err) }
+                    ? { ...item, state: "error", error: errorMessage(err), finishedAt: Date.now() }
                     : item,
                 ),
               );
@@ -1724,13 +1744,23 @@ function ActivityTray({
 }) {
   const [minimized, setMinimized] = useState(false);
   if (!activities.length) return null;
+  const clear = () => {
+    activities
+      .filter((activity) => activity.state !== "active")
+      .forEach((activity) => onDismiss(activity.id));
+  };
   return (
     <div className={`activity-tray ${minimized ? "minimized" : ""}`}>
       <div className="activity-header">
         <strong>Activity</strong>
-        <button onClick={() => setMinimized((value) => !value)}>
-          {minimized ? "Show" : "Minimize"}
-        </button>
+        <div className="activity-header-actions">
+          {activities.some((activity) => activity.state !== "active") && (
+            <button onClick={clear}>Clear</button>
+          )}
+          <button onClick={() => setMinimized((value) => !value)}>
+            {minimized ? "Show" : "Minimize"}
+          </button>
+        </div>
       </div>
       {!minimized && (
         <div className="activity-list">

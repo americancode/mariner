@@ -639,6 +639,11 @@ html[data-theme="dark"] .modal-warning strong {
   font-size: 12px;
   font-weight: 700;
 }
+.activity-header-actions {
+  align-items: center;
+  display: flex;
+  gap: 14px;
+}
 .activity-list {
   max-height: 330px;
   overflow-y: auto;
