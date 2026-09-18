@@ -135,6 +135,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/auth/callback", s.callback)
 	r.Get("/auth/logout", s.logout)
 	r.Get("/api/me", s.me)
+	r.Get("/healthz", healthz)
 	r.Get("/api/admin/audit", s.adminAudit)
 	r.Get("/api/admin/audit/actions", s.adminAuditActions)
 	r.Get("/api/admin/preferences", s.adminPreferences)
@@ -176,6 +177,12 @@ func (s *Server) Router() http.Handler {
 	r.Get("/admin/*", spa)
 	r.Handle("/*", http.FileServer(http.Dir("/web")))
 	return r
+}
+
+func healthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, "ok\n")
 }
 
 func (s *Server) uploadStatus(w http.ResponseWriter, r *http.Request) {
