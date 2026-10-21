@@ -10,6 +10,14 @@ image:
 # Chart defaults remain bounded for normal deployments.
 resources: null
 
+logging:
+  level: debug
+
+upload:
+  multipart:
+    partSize: 16777216
+    concurrency: 1
+
 persistence:
   enabled: false
 

@@ -1,4 +1,7 @@
 replicaCount: 1
+# IANA timezone used by the application container. Persisted timestamps are
+# always UTC; keeping the process timezone explicit makes logs deterministic.
+timezone: UTC
 image:
   repository: ghcr.io/example/mariner
   # Empty uses the chart's appVersion.
@@ -13,6 +16,12 @@ resources:
   limits:
     cpu: 500m
     memory: 256Mi
+# Browser multipart uploads use these settings for each large file. partSize
+# is expressed in bytes and must satisfy the S3 multipart limits (5 MiB-5 GiB).
+upload:
+  multipart:
+    partSize: 16777216
+    concurrency: 1
 podSecurityContext:
   fsGroup: 65532
   seccompProfile:
@@ -137,6 +146,19 @@ caBundle:
   # Custom CA files are mounted directly into the Mariner container and
   # appended to the platform trust pool by tlsconfig.RootCAs.
 cookieSecret: ""
+rateLimit:
+  # These limits protect authentication and S3 connection-test endpoints.
+  # They are process-local; use an ingress/global limiter for multi-replica
+  # deployments when a shared limit is required.
+  enabled: true
+  window: 1m
+  loginPerWindow: 10
+  unlockPerWindow: 10
+  connectionTestPerWindow: 30
+logging:
+  # Structured JSON logs are emitted to stdout. Valid levels: debug, info,
+  # warn, and error.
+  level: info
 audit:
   enabled: true
   sidecar:

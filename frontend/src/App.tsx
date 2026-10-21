@@ -23,20 +23,20 @@ import {
   UnlockKeyhole,
   X,
 } from "lucide-react";
-import {
-  api,
-  AuditEvent,
-  Connection,
-  Item,
-  MultipartUpload,
-  ObjectVersion,
-  Organization,
-} from "./api";
+import { api, Connection, Item, MultipartUpload, ObjectVersion } from "./api";
+import { AdminPage as ModularAdminPage } from "./pages/AdminPage";
+import { errorMessage } from "./utils/errors";
+import { consumePromptUnlockAfterSignIn, signOut } from "./utils/navigation";
+import { useTheme } from "./hooks/useTheme";
 
 type User = { authenticated: boolean; name?: string; isAdmin?: boolean };
 type ErrorHandler = (message: string) => void;
 type ItemFilter = { files: boolean; folders: boolean; multipart: boolean };
-const defaultItemFilter: ItemFilter = { files: true, folders: true, multipart: false };
+const defaultItemFilter: ItemFilter = {
+  files: true,
+  folders: true,
+  multipart: false,
+};
 function browseKind(filter: ItemFilter): "all" | "file" | "folder" {
   if (filter.files && !filter.folders) return "file";
   if (filter.folders && !filter.files) return "folder";
@@ -46,22 +46,11 @@ function multipartSelectionKey(upload: MultipartUpload) {
   return `multipart:${upload.uploadId}`;
 }
 function sameItemFilter(left: ItemFilter, right: ItemFilter) {
-  return left.files === right.files && left.folders === right.folders && left.multipart === right.multipart;
-}
-
-const promptUnlockAfterSignInKey = "mariner_prompt_unlock_after_sign_in";
-const themeStorageKey = "mariner.theme";
-
-function storedThemeIsDark() {
-  return window.localStorage.getItem(themeStorageKey) === "dark";
-}
-
-function markSignOut() {
-  sessionStorage.setItem(promptUnlockAfterSignInKey, "true");
-}
-
-function promptUnlockOnReturn() {
-  sessionStorage.setItem(promptUnlockAfterSignInKey, "true");
+  return (
+    left.files === right.files &&
+    left.folders === right.folders &&
+    left.multipart === right.multipart
+  );
 }
 type ConnectionForm = {
   id?: string;
@@ -79,17 +68,12 @@ type Activity = {
   context: string;
   kind: "upload" | "delete" | "download";
   progress: number;
-  state: "active" | "done" | "error";
+  phase?: "uploading" | "finalizing";
+  state: "active" | "done" | "error" | "canceled";
   error?: string;
   finishedAt?: number;
 };
 type ActivitySetter = React.Dispatch<React.SetStateAction<Activity[]>>;
-const auditColumns = [
-  ["date", "Date"], ["user", "User"], ["action", "Action"],
-  ["bucket", "Bucket"], ["object", "Object"], ["result", "Result"],
-  ["sha256", "SHA-256"],
-] as const;
-
 export function App() {
   const [user, setUser] = useState<User>();
   const [connections, setConnections] = useState<Connection[]>([]);
@@ -110,16 +94,14 @@ export function App() {
   const [editingConnection, setEditingConnection] = useState<Connection>();
   const [connectionDeleteTarget, setConnectionDeleteTarget] =
     useState<Connection>();
-  const [darkMode, setDarkMode] = useState(storedThemeIsDark);
-  const currentView = useRef({ activeConnection, prefix, itemFilter, searchQuery });
+  const { darkMode, setTheme } = useTheme();
+  const currentView = useRef({
+    activeConnection,
+    prefix,
+    itemFilter,
+    searchQuery,
+  });
   currentView.current = { activeConnection, prefix, itemFilter, searchQuery };
-  function setTheme(theme: "light" | "dark") {
-    setDarkMode(theme === "dark");
-    window.localStorage.setItem(themeStorageKey, theme);
-  }
-  useEffect(() => {
-    document.documentElement.dataset.theme = darkMode ? "dark" : "light";
-  }, [darkMode]);
 
   useEffect(() => {
     api
@@ -141,11 +123,7 @@ export function App() {
       .status()
       .then(({ exists }) => {
         setVaultExists(exists);
-        const promptAfterSignIn =
-          sessionStorage.getItem(promptUnlockAfterSignInKey) === "true";
-        if (promptAfterSignIn) {
-          sessionStorage.removeItem(promptUnlockAfterSignInKey);
-        }
+        const promptAfterSignIn = consumePromptUnlockAfterSignIn();
         setUnlockOpen(!exists || promptAfterSignIn);
       })
       .catch((err) => setError(errorMessage(err)));
@@ -161,7 +139,11 @@ export function App() {
     setSearchQuery("");
     setLoading(true);
     try {
-      const result = await api.browse(connection.id, nextPrefix, browseKind(kind));
+      const result = await api.browse(
+        connection.id,
+        nextPrefix,
+        browseKind(kind),
+      );
       setItems(result.items);
       setNextToken(result.nextToken ?? "");
       setHasMore(result.hasMore);
@@ -188,7 +170,8 @@ export function App() {
           latestView.prefix !== view.prefix ||
           !sameItemFilter(latestView.itemFilter, view.itemFilter) ||
           latestView.searchQuery !== view.searchQuery
-        ) return;
+        )
+          return;
         setItems(result.items);
         setNextToken("");
         setHasMore(false);
@@ -285,7 +268,8 @@ export function App() {
   if (!user) return <main className="center">Loading…</main>;
   if (!user.authenticated)
     return <main className="center">Redirecting to sign in…</main>;
-  if (window.location.pathname.startsWith("/admin")) return <AdminPage />;
+  if (window.location.pathname.startsWith("/admin"))
+    return <ModularAdminPage />;
   return (
     <div className="layout">
       <Sidebar
@@ -327,7 +311,12 @@ export function App() {
           if (query.trim()) {
             setLoading(true);
             api
-              .search(activeConnection.id, prefix, query, browseKind(itemFilter))
+              .search(
+                activeConnection.id,
+                prefix,
+                query,
+                browseKind(itemFilter),
+              )
               .then((result) => {
                 setItems(result.items);
                 setNextToken("");
@@ -345,7 +334,12 @@ export function App() {
             if (searchQuery.trim()) {
               setLoading(true);
               api
-                .search(activeConnection.id, prefix, searchQuery, browseKind(nextFilter))
+                .search(
+                  activeConnection.id,
+                  prefix,
+                  searchQuery,
+                  browseKind(nextFilter),
+                )
                 .then((result) => {
                   setItems(result.items);
                   setNextToken("");
@@ -374,11 +368,11 @@ export function App() {
               setConnections(await api.unlock(password));
               setVaultExists(true);
               setVaultUnlocked(true);
-              const theme = (await api.settings()).theme === "dark" ? "dark" : "light";
+              const theme =
+                (await api.settings()).theme === "dark" ? "dark" : "light";
               setTheme(theme);
               setUnlockOpen(false);
             } catch (err) {
-              setError(errorMessage(err));
               throw err;
             }
           }}
@@ -415,182 +409,6 @@ export function App() {
     </div>
   );
 }
-
-function AdminPage() {
-  const auditPage = window.location.pathname.startsWith("/admin/audit");
-  const organizationsPage = window.location.pathname.startsWith(
-    "/admin/organizations",
-  );
-  return (
-    <div className="admin-layout">
-      <aside className="admin-sidebar">
-        <a className="logo" href="/">mariner</a>
-        <span className="eyebrow">ADMINISTRATION</span>
-        <nav className="admin-nav" aria-label="Admin navigation">
-          <a className={!auditPage && !organizationsPage ? "active" : ""} href="/admin">Overview</a>
-          <a className={auditPage ? "active" : ""} href="/admin/audit">Audit logs</a>
-          <a className={organizationsPage ? "active" : ""} href="/admin/organizations">Organizations</a>
-        </nav>
-        <a className="secondary admin-back" href="/" onClick={promptUnlockOnReturn}>
-          Back to Mariner
-        </a>
-      </aside>
-      <main className="admin-main">
-        <a className="sign-out admin-sign-out" href="/auth/logout" onClick={markSignOut}>
-          Sign out
-        </a>
-        {auditPage ? <AdminAuditPage /> : organizationsPage ? <AdminOrganizationsPage /> : <AdminOverviewPage />}
-      </main>
-    </div>
-  );
-}
-
-function AdminOverviewPage() {
-  return (
-    <section className="admin-landing">
-      <span className="eyebrow">ADMINISTRATION</span>
-      <h1>Mariner administration</h1>
-      <p>Manage application activity and organization access from one workspace.</p>
-      <div className="admin-cards">
-        <a className="card admin-card" href="/admin/audit"><h2>Audit logs</h2><p>Search security and S3 activity with database-backed filters.</p></a>
-        <a className="card admin-card" href="/admin/organizations"><h2>Organizations</h2><p>Configure groups and shared connections.</p></a>
-      </div>
-    </section>
-  );
-}
-
-function AdminOrganizationsPage() {
-  const [organizations, setOrganizations] = useState<Organization[]>([]);
-  const [editing, setEditing] = useState<Organization>();
-  const [error, setError] = useState("");
-  const empty: Organization = { id: "", name: "", groups: [], provisioned: false, connections: {} };
-  async function refresh() { try { setOrganizations(await api.adminOrganizations()); } catch (err) { setError(errorMessage(err)); } }
-  useEffect(() => { void refresh(); }, []);
-  async function save(event: FormEvent) { event.preventDefault(); if (!editing) return; const normalized = { ...editing, connections: Object.fromEntries(Object.entries(editing.connections).map(([key, connection]) => [key, { ...connection, region: connection.region || "us-east-1" }])) }; try { if (organizations.some((item) => item.id === editing.id)) await api.updateOrganization(normalized); else await api.createOrganization(normalized); setEditing(undefined); await refresh(); } catch (err) { setError(errorMessage(err)); } }
-  async function remove(id: string) { if (!window.confirm(`Delete organization ${id}?`)) return; try { await api.deleteOrganization(id); await refresh(); } catch (err) { setError(errorMessage(err)); } }
-  return (
-    <section className="admin-page">
-      <div className="admin-header"><div><span className="eyebrow">ADMINISTRATION</span><h1>Organizations</h1><p>Map OIDC groups to shared S3 connections.</p></div><button className="button" onClick={() => setEditing(empty)}>New organization</button></div>
-      {error && <p className="form-error" role="alert">{error}</p>}
-      <div className="org-list">{organizations.map((organization) => <article className="card org-card" key={organization.id}><div><h2>{organization.name}</h2><p><code>{organization.id}</code> · Groups: {organization.groups.join(", ") || "none"}</p><small>{Object.keys(organization.connections).length} connection(s){organization.provisioned ? " · Provisioned by Helm" : ""}</small></div><div className="org-actions">{organization.provisioned ? <span className="provisioned-label">Provisioned</span> : <><button className="secondary" onClick={() => setEditing({ ...organization, connections: { ...organization.connections } })}>Edit</button><button className="danger" onClick={() => void remove(organization.id)}>Delete</button></>}</div></article>)}</div>
-      {editing && <OrganizationForm organization={editing} onChange={setEditing} onCancel={() => setEditing(undefined)} onSubmit={save} />}
-    </section>
-  );
-}
-
-function OrganizationForm({ organization, onChange, onCancel, onSubmit }: { organization: Organization; onChange: (value: Organization) => void; onCancel: () => void; onSubmit: (event: FormEvent) => void }) {
-  const connections = Object.entries(organization.connections);
-  const [testing, setTesting] = useState<string>();
-  const [testResults, setTestResults] = useState<Record<string, string>>({});
-  function updateConnection(name: string, value: Partial<Organization["connections"][string]>) { onChange({ ...organization, connections: { ...organization.connections, [name]: { ...organization.connections[name], ...value } } }); }
-  return <form className="card org-form" onSubmit={onSubmit}><h2>{organization.id ? "Edit organization" : "New organization"}</h2><div className="form-grid"><label>ID<input required value={organization.id} disabled={organization.provisioned} onChange={(e) => onChange({ ...organization, id: e.target.value })} /></label><label>Name<input required value={organization.name} onChange={(e) => onChange({ ...organization, name: e.target.value })} /></label><label className="full-width">OIDC groups<span>comma-separated exact values</span><input value={organization.groups.join(", ")} onChange={(e) => onChange({ ...organization, groups: e.target.value.split(",").map((item) => item.trim()).filter(Boolean) })} /></label></div><div className="org-connections"><div className="org-section-heading"><h3>Default connections</h3><button type="button" className="secondary" onClick={() => { const name = `connection-${connections.length + 1}`; onChange({ ...organization, connections: { ...organization.connections, [name]: { id: name, name, bucket: "", region: "us-east-1", endpoint: "", prefix: "" } } }); }}>Add connection</button></div>{connections.map(([key, connection]) => <div className="connection-editor" key={key}><label>Name<input required value={connection.name} onChange={(e) => updateConnection(key, { name: e.target.value })} /></label><label>Bucket<input required value={connection.bucket} onChange={(e) => updateConnection(key, { bucket: e.target.value })} /></label><label>Endpoint<input value={connection.endpoint} onChange={(e) => updateConnection(key, { endpoint: e.target.value })} /></label><label>Region<input value={connection.region || "us-east-1"} onChange={(e) => updateConnection(key, { region: e.target.value })} placeholder="us-east-1" /></label><label>Access key<input type="text" placeholder="unchanged if blank" value={connection.accessKey || ""} onChange={(e) => updateConnection(key, { accessKey: e.target.value })} /></label><label>Secret key<input type="password" placeholder="unchanged if blank" value={connection.secretKey || ""} onChange={(e) => updateConnection(key, { secretKey: e.target.value })} /></label><div className="connection-test"><button type="button" className="secondary" disabled={testing === key || !connection.accessKey || !connection.secretKey} onClick={async () => { setTesting(key); setTestResults({ ...testResults, [key]: "Testing connection…" }); try { await api.testConnection({ ...connection, id: "", region: connection.region || "us-east-1" }); setTestResults({ ...testResults, [key]: "Connection successful" }); } catch (err) { setTestResults({ ...testResults, [key]: errorMessage(err) }); } finally { setTesting(undefined); } }}>{testing === key ? "Testing…" : "Test connection"}</button>{testResults[key] && <span className={testResults[key] === "Connection successful" ? "test-success" : "field-error"}>{testResults[key]}</span>}</div><button type="button" className="danger" onClick={() => { const next = { ...organization.connections }; delete next[key]; onChange({ ...organization, connections: next }); }}>Remove</button></div>)}</div><div className="modal-actions"><button type="button" className="secondary" onClick={onCancel}>Cancel</button><button className="button" type="submit">Save organization</button></div></form>;
-}
-
-function AdminAuditPage() {
-  const [filters, setFilters] = useState({
-    user: "",
-    bucket: "",
-    action: "",
-    start: "",
-    end: "",
-  });
-  const [events, setEvents] = useState<AuditEvent[]>([]);
-  const [hasMore, setHasMore] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [activeFilters, setActiveFilters] = useState(filters);
-  const [actionOptions, setActionOptions] = useState<string[]>([]);
-  const [visibleColumns, setVisibleColumns] = useState<Record<string, boolean>>(
-    Object.fromEntries(auditColumns.map(([key]) => [key, true])),
-  );
-  const [showColumns, setShowColumns] = useState(false);
-  function localDateTime(value: string) {
-    return value ? new Date(value).toISOString() : "";
-  }
-  async function load(nextFilters = activeFilters, offset = 0) {
-    setLoading(true);
-    setError("");
-    try {
-      const page = await api.audit(nextFilters, offset);
-      setEvents((current) => (offset ? [...current, ...page.events] : page.events));
-      setHasMore(page.hasMore);
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-  useEffect(() => {
-    void load();
-    api.auditActions().then(setActionOptions).catch((err) => setError(errorMessage(err)));
-    api.adminPreferences().then((saved) => setVisibleColumns((current) => ({ ...current, ...saved }))).catch((err) => setError(errorMessage(err)));
-  }, []);
-  async function toggleColumn(key: string) {
-    const next = { ...visibleColumns, [key]: !visibleColumns[key] };
-    if (Object.values(next).every((value) => !value)) return;
-    setVisibleColumns(next);
-    try { await api.updateAdminPreferences(next); } catch (err) { setError(errorMessage(err)); }
-  }
-  function submit(event: FormEvent) {
-    event.preventDefault();
-    const nextFilters = {
-      ...filters,
-      start: localDateTime(filters.start),
-      end: localDateTime(filters.end),
-    };
-    setActiveFilters(nextFilters);
-    void load(nextFilters);
-  }
-  function applyRange(minutes: number) {
-    const end = new Date();
-    const start = new Date(end.getTime() - minutes * 60 * 1000);
-    const toLocal = (date: Date) => {
-      const offset = date.getTimezoneOffset() * 60000;
-      return new Date(date.getTime() - offset).toISOString().slice(0, 16);
-    };
-    setFilters({ ...filters, start: toLocal(start), end: toLocal(end) });
-  }
-  return (
-    <section className="admin-page">
-      <div className="admin-header">
-        <div>
-          <span className="eyebrow">ADMINISTRATION</span>
-          <h1>Application audit log</h1>
-          <p>Search security and S3 activity from the database.</p>
-        </div>
-        <button className="secondary" type="button" onClick={() => setShowColumns(!showColumns)}>Columns</button>
-      </div>
-      {showColumns && <div className="card column-picker" aria-label="Audit columns">{auditColumns.map(([key, label]) => <label key={key}><input type="checkbox" checked={visibleColumns[key]} onChange={() => void toggleColumn(key)} />{label}</label>)}</div>}
-      <form className="card audit-filters" onSubmit={submit}>
-        <div className="form-grid">
-          <label>User <span>(ID or name)</span><input value={filters.user} onChange={(e) => setFilters({ ...filters, user: e.target.value })} placeholder="user@example.com" /></label>
-          <label>Bucket<input value={filters.bucket} onChange={(e) => setFilters({ ...filters, bucket: e.target.value })} placeholder="bucket-name" /></label>
-          <label>Action<select value={filters.action} onChange={(e) => setFilters({ ...filters, action: e.target.value })}><option value="">All actions</option>{actionOptions.map((action) => <option key={action} value={action}>{action}</option>)}</select></label>
-          <label>From date and time<input type="datetime-local" value={filters.start} onChange={(e) => setFilters({ ...filters, start: e.target.value })} /></label>
-          <label>Through date and time<input type="datetime-local" value={filters.end} onChange={(e) => setFilters({ ...filters, end: e.target.value })} /></label>
-        </div>
-        <div className="audit-presets" aria-label="Time range presets">
-          <span>Quick range</span>
-          <button type="button" className="secondary" onClick={() => applyRange(15)}>Last 15 minutes</button>
-          <button type="button" className="secondary" onClick={() => applyRange(60)}>Last hour</button>
-          <button type="button" className="secondary" onClick={() => applyRange(1440)}>Last day</button>
-          <button type="button" className="secondary" onClick={() => applyRange(10080)}>Last week</button>
-        </div>
-        <div className="modal-actions"><button className="button" type="submit" disabled={loading}>{loading && <LoaderCircle className="spin" size={15} />}Apply filters</button></div>
-      </form>
-      {error && <p className="form-error" role="alert">{error}</p>}
-      <section className="card audit-results">
-        {loading && !events.length ? <div className="admin-loading"><LoaderCircle className="spin" size={22} />Loading audit events…</div> : events.length ? <AuditTable events={events} visibleColumns={visibleColumns} /> : <p className="admin-empty">No audit events match these filters.</p>}
-        {hasMore && <button className="secondary load-more" onClick={() => void load(activeFilters, events.length)} disabled={loading}>{loading && <LoaderCircle className="spin" size={15} />}Load more</button>}
-      </section>
-    </section>
-  );
-}
-
-function AuditTable({ events, visibleColumns }: { events: AuditEvent[]; visibleColumns: Record<string, boolean> }) {
-  return <div className="audit-table-wrap"><table className="audit-table"><thead><tr>{visibleColumns.date && <th>Date</th>}{visibleColumns.user && <th>User</th>}{visibleColumns.action && <th>Action</th>}{visibleColumns.bucket && <th>Bucket</th>}{visibleColumns.object && <th>Object</th>}{visibleColumns.result && <th>Result</th>}{visibleColumns.sha256 && <th>SHA-256</th>}</tr></thead><tbody>{events.map((event) => <tr key={event.event_id}>{visibleColumns.date && <td>{new Date(event.occurred_at).toLocaleString()}</td>}{visibleColumns.user && <td>{event.user_name || event.user_id || "—"}</td>}{visibleColumns.action && <td><code>{event.action}</code></td>}{visibleColumns.bucket && <td>{event.bucket || "—"}</td>}{visibleColumns.object && <td>{event.object_key || "—"}</td>}{visibleColumns.result && <td><span className={`audit-result ${event.result}`}>{event.result}</span></td>}{visibleColumns.sha256 && <td><code className="digest">{event.file_sha256 || "—"}</code></td>}</tr>)}</tbody></table></div>;
-}
-
 function Login() {
   return (
     <main className="center">
@@ -643,66 +461,70 @@ function Sidebar({
       <p>{userName?.trim() || "OIDC user"}</p>
       <span className="eyebrow">CONNECTIONS</span>
       <div className="connection-list">
-      {connections.map((connection) => (
-        <button
-          disabled={!vaultUnlocked}
-          className={
-            activeConnection?.id === connection.id
-              ? "connection active"
-              : "connection"
-          }
-          onClick={() => onBrowse(connection)}
-          key={connection.id}
-        >
-          <span className="connection-label">
-            {connection.name}
-            <small>{connection.bucket}</small>
-          </span>
-          {!connection.id.includes(":") && (
-            <span className="connection-actions">
-              <span
-                role="button"
-                tabIndex={0}
-                aria-label={`Edit ${connection.name}`}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onEditConnection(connection);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
+        {connections.map((connection) => (
+          <button
+            disabled={!vaultUnlocked}
+            className={
+              activeConnection?.id === connection.id
+                ? "connection active"
+                : "connection"
+            }
+            onClick={() => onBrowse(connection)}
+            key={connection.id}
+          >
+            <span className="connection-label">
+              {connection.name}
+              <small>{connection.bucket}</small>
+            </span>
+            {!connection.id.includes(":") && (
+              <span className="connection-actions">
+                <span
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Edit ${connection.name}`}
+                  onClick={(event) => {
                     event.stopPropagation();
                     onEditConnection(connection);
-                  }
-                }}
-              >
-                <Pencil size={14} />
-              </span>
-              <span
-                role="button"
-                tabIndex={0}
-                aria-label={`Delete ${connection.name}`}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onDeleteConnection(connection);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.stopPropagation();
+                      onEditConnection(connection);
+                    }
+                  }}
+                >
+                  <Pencil size={14} />
+                </span>
+                <span
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Delete ${connection.name}`}
+                  onClick={(event) => {
                     event.stopPropagation();
                     onDeleteConnection(connection);
-                  }
-                }}
-              >
-                <Trash2 size={14} />
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.stopPropagation();
+                      onDeleteConnection(connection);
+                    }
+                  }}
+                >
+                  <Trash2 size={14} />
+                </span>
               </span>
-            </span>
-          )}
-        </button>
-      ))}
+            )}
+          </button>
+        ))}
       </div>
       <button
         className="secondary add"
         disabled={!vaultUnlocked}
-        title={vaultUnlocked ? "Add a bucket connection" : "Unlock your vault to add a connection"}
+        title={
+          vaultUnlocked
+            ? "Add a bucket connection"
+            : "Unlock your vault to add a connection"
+        }
         onClick={onAddConnection}
       >
         <Plus size={16} /> Add connection
@@ -730,7 +552,11 @@ function Sidebar({
             }
           }}
         >
-          {vaultUnlocked ? <LockKeyhole size={15} /> : <UnlockKeyhole size={15} />}
+          {vaultUnlocked ? (
+            <LockKeyhole size={15} />
+          ) : (
+            <UnlockKeyhole size={15} />
+          )}
           {vaultUnlocked ? "Lock vault" : "Unlock vault"}
         </button>
       </div>
@@ -774,6 +600,10 @@ function Workspace({
   onFilterChange: (filter: ItemFilter) => void;
 }) {
   const [activities, setActivities] = useState<Activity[]>([]);
+  const uploadControllers = useRef(new Map<string, AbortController>());
+  function cancelUpload(id: string) {
+    uploadControllers.current.get(id)?.abort();
+  }
   useEffect(() => {
     const timer = window.setInterval(() => {
       const now = Date.now();
@@ -796,7 +626,7 @@ function Workspace({
           <span className="eyebrow">BUCKET EXPLORER</span>
           <h1>{connection?.name ?? "Your workspace"}</h1>
         </div>
-        <a className="sign-out" href="/auth/logout" onClick={markSignOut}>
+        <a className="sign-out" href="/auth/logout" onClick={signOut}>
           Sign out
         </a>
       </header>
@@ -813,6 +643,7 @@ function Workspace({
             prefix={prefix}
             items={items}
             setActivities={setActivities}
+            uploadControllers={uploadControllers}
             onBrowse={onBrowse}
             onRefresh={onRefresh}
             onError={onError}
@@ -843,6 +674,7 @@ function Workspace({
       )}
       <ActivityTray
         activities={activities}
+        onCancel={cancelUpload}
         onDismiss={(id) =>
           setActivities((current) => current.filter((item) => item.id !== id))
         }
@@ -867,6 +699,7 @@ function UnlockModal({
   const [visible, setVisible] = useState(false);
   const [confirmDestroy, setConfirmDestroy] = useState(false);
   const [validationError, setValidationError] = useState("");
+  const [unlockError, setUnlockError] = useState("");
   const [unlocking, setUnlocking] = useState(false);
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -876,10 +709,12 @@ function UnlockModal({
       return;
     }
     setValidationError("");
+    setUnlockError("");
     setUnlocking(true);
     try {
       await onUnlock(password);
-    } catch {
+    } catch (err) {
+      setUnlockError(errorMessage(err));
       setUnlocking(false);
     }
   }
@@ -923,6 +758,7 @@ function UnlockModal({
               onChange={(event) => {
                 setPassword(event.target.value);
                 setValidationError("");
+                setUnlockError("");
               }}
               placeholder="Master password"
               minLength={10}
@@ -949,6 +785,7 @@ function UnlockModal({
               onChange={(event) => {
                 setConfirmation(event.target.value);
                 setValidationError("");
+                setUnlockError("");
               }}
               placeholder="Retype master password"
               minLength={10}
@@ -957,6 +794,11 @@ function UnlockModal({
           </label>
         )}
         {validationError && <p className="form-error">{validationError}</p>}
+        {unlockError && (
+          <p className="form-error" role="alert">
+            {unlockError}
+          </p>
+        )}
         <button className="button" type="submit" disabled={unlocking}>
           {unlocking && <LoaderCircle className="spin" size={17} />}
           {unlocking
@@ -995,10 +837,10 @@ function UnlockModal({
                 undone, and you will need to create a new master password.
               </p>
               <div className="modal-actions">
-                  <button
-                    type="button"
-                    className="secondary"
-                    disabled={unlocking}
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={unlocking}
                   onClick={() => setConfirmDestroy(false)}
                 >
                   Keep vault
@@ -1072,7 +914,9 @@ function ConnectionModal({
   }
   async function test() {
     if (!validateForm()) {
-      setTestError("Complete the required fields before testing the connection.");
+      setTestError(
+        "Complete the required fields before testing the connection.",
+      );
       return;
     }
     setTesting(true);
@@ -1232,6 +1076,7 @@ function Explorer({
   prefix,
   items,
   setActivities,
+  uploadControllers,
   onBrowse,
   onRefresh,
   onError,
@@ -1247,6 +1092,7 @@ function Explorer({
   prefix: string;
   items: Item[];
   setActivities: ActivitySetter;
+  uploadControllers: React.MutableRefObject<Map<string, AbortController>>;
   onBrowse: (connection: Connection, prefix?: string) => void;
   onRefresh: () => Promise<void>;
   onError: ErrorHandler;
@@ -1263,7 +1109,9 @@ function Explorer({
   const [dragging, setDragging] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Item>();
   const [deleteSelectionOpen, setDeleteSelectionOpen] = useState(false);
-  const [multipartUploads, setMultipartUploads] = useState<MultipartUpload[]>([]);
+  const [multipartUploads, setMultipartUploads] = useState<MultipartUpload[]>(
+    [],
+  );
   const [multipartLoading, setMultipartLoading] = useState(true);
   const [multipartError, setMultipartError] = useState("");
   const [multipartAbortTarget, setMultipartAbortTarget] =
@@ -1275,31 +1123,43 @@ function Explorer({
     return () => window.clearTimeout(timer);
   }, [searchInput, searchQuery, onSearchChange]);
   useEffect(() => {
+    if (!itemFilter.multipart) {
+      setMultipartLoading(false);
+      setMultipartError("");
+      return;
+    }
+
+    const controller = new AbortController();
     let current = true;
     setMultipartLoading(true);
     setMultipartError("");
     api
-      .multipartUploads(connection.id, prefix)
+      .multipartUploads(connection.id, prefix, controller.signal)
       .then(({ uploads }) => {
         if (current) setMultipartUploads(uploads);
       })
       .catch((err) => {
-        if (current) setMultipartError(errorMessage(err));
+        if (current && !controller.signal.aborted) {
+          setMultipartError(errorMessage(err));
+        }
       })
       .finally(() => {
         if (current) setMultipartLoading(false);
       });
     return () => {
       current = false;
+      controller.abort();
     };
-  }, [connection.id, prefix]);
+  }, [connection.id, prefix, itemFilter.multipart]);
 
   async function confirmAbortMultipart() {
     if (!multipartAbortTarget) return;
     try {
       await api.abortMultipart(connection.id, multipartAbortTarget);
       setMultipartUploads((current) =>
-        current.filter((item) => item.uploadId !== multipartAbortTarget.uploadId),
+        current.filter(
+          (item) => item.uploadId !== multipartAbortTarget.uploadId,
+        ),
       );
       setMultipartAbortTarget(undefined);
     } catch (err) {
@@ -1310,6 +1170,18 @@ function Explorer({
     item.kind === "file" ? itemFilter.files : itemFilter.folders,
   );
   const visibleMultipartUploads = itemFilter.multipart ? multipartUploads : [];
+  const tableRows: BucketTableRow[] = [
+    ...visibleItems.map((item) => ({ type: "object" as const, item })),
+    ...visibleMultipartUploads.map((upload) => ({
+      type: "multipart" as const,
+      upload,
+    })),
+  ].sort((left, right) => {
+    const leftName = left.type === "object" ? left.item.name : left.upload.key;
+    const rightName =
+      right.type === "object" ? right.item.name : right.upload.key;
+    return leftName.localeCompare(rightName);
+  });
   const breadcrumbSegments = prefix
     .split("/")
     .filter(Boolean)
@@ -1319,12 +1191,20 @@ function Explorer({
     }));
   const activityContext = `${connection.name} / ${connection.bucket}`;
   async function downloadArchive(format: "zip" | "tgz") {
-    if (Array.from(selected).some((key) => key.startsWith("multipart:"))) return;
+    if (Array.from(selected).some((key) => key.startsWith("multipart:")))
+      return;
     const id = `${Date.now()}-${format}`;
     const label = `${connection.bucket}${prefix ? `/${prefix}` : ""}.${format}`;
     setActivities((current) => [
       ...current,
-      { id, label, context: activityContext, kind: "download", progress: 35, state: "active" },
+      {
+        id,
+        label,
+        context: activityContext,
+        kind: "download",
+        progress: 35,
+        state: "active",
+      },
     ]);
     try {
       const blob = await api.download(connection.id, prefix, format);
@@ -1345,7 +1225,12 @@ function Explorer({
       setActivities((current) =>
         current.map((item) =>
           item.id === id
-            ? { ...item, state: "error", error: errorMessage(err), finishedAt: Date.now() }
+            ? {
+                ...item,
+                state: "error",
+                error: errorMessage(err),
+                finishedAt: Date.now(),
+              }
             : item,
         ),
       );
@@ -1358,7 +1243,8 @@ function Explorer({
     ...visibleMultipartUploads.map(multipartSelectionKey),
   ];
   const allVisibleSelected =
-    selectableKeys.length > 0 && selectableKeys.every((key) => selected.has(key));
+    selectableKeys.length > 0 &&
+    selectableKeys.every((key) => selected.has(key));
 
   function toggleSelected(key: string) {
     setSelectionAnchor(key);
@@ -1386,24 +1272,23 @@ function Explorer({
     return true;
   }
   function selectAll() {
-    setSelected(
-      (current) =>
-        new Set([...current, ...selectableKeys]),
-    );
+    setSelected((current) => new Set([...current, ...selectableKeys]));
   }
   async function deleteSelected() {
     if (!selected.size) return;
     setDeleteSelectionOpen(true);
   }
   async function confirmDeleteSelected() {
-    const pending = Array.from(selected).filter((key) => !key.startsWith("multipart:" )).map((key, index) => {
-      const item = items.find((candidate) => candidate.key === key);
-      return {
-        key,
-        id: `${Date.now()}-${index}-${key}`,
-        label: item?.name || key,
-      };
-    });
+    const pending = Array.from(selected)
+      .filter((key) => !key.startsWith("multipart:"))
+      .map((key, index) => {
+        const item = items.find((candidate) => candidate.key === key);
+        return {
+          key,
+          id: `${Date.now()}-${index}-${key}`,
+          label: item?.name || key,
+        };
+      });
     const selectedMultipart = multipartUploads.filter((upload) =>
       selected.has(multipartSelectionKey(upload)),
     );
@@ -1438,7 +1323,12 @@ function Explorer({
           setActivities((current) =>
             current.map((activity) =>
               activity.id === id
-                ? { ...activity, progress: 100, state: "done", finishedAt: Date.now() }
+                ? {
+                    ...activity,
+                    progress: 100,
+                    state: "done",
+                    finishedAt: Date.now(),
+                  }
                 : activity,
             ),
           );
@@ -1446,7 +1336,12 @@ function Explorer({
           setActivities((current) =>
             current.map((activity) =>
               activity.id === id
-                ? { ...activity, state: "error", error: errorMessage(err), finishedAt: Date.now() }
+                ? {
+                    ...activity,
+                    state: "error",
+                    error: errorMessage(err),
+                    finishedAt: Date.now(),
+                  }
                 : activity,
             ),
           );
@@ -1463,7 +1358,12 @@ function Explorer({
           setActivities((current) =>
             current.map((activity) =>
               activity.id === id
-                ? { ...activity, progress: 100, state: "done", finishedAt: Date.now() }
+                ? {
+                    ...activity,
+                    progress: 100,
+                    state: "done",
+                    finishedAt: Date.now(),
+                  }
                 : activity,
             ),
           );
@@ -1471,7 +1371,12 @@ function Explorer({
           setActivities((current) =>
             current.map((activity) =>
               activity.id === id
-                ? { ...activity, state: "error", error: errorMessage(err), finishedAt: Date.now() }
+                ? {
+                    ...activity,
+                    state: "error",
+                    error: errorMessage(err),
+                    finishedAt: Date.now(),
+                  }
                 : activity,
             ),
           );
@@ -1486,6 +1391,7 @@ function Explorer({
     const pending = Array.from(files).map((file, index) => ({
       file,
       id: `${Date.now()}-${index}-${file.name}`,
+      controller: new AbortController(),
     }));
     if (!pending.length) return;
     setActivities((current) => [
@@ -1499,31 +1405,65 @@ function Explorer({
         state: "active" as const,
       })),
     ]);
+    pending.forEach(({ id, controller }) =>
+      uploadControllers.current.set(id, controller),
+    );
     await Promise.all(
-      pending.map(async ({ file, id }) => {
+      pending.map(async ({ file, id, controller }) => {
         try {
-          await api.upload(connection.id, prefix, file, (progress) =>
-            setActivities((current) =>
-              current.map((item) =>
-                item.id === id ? { ...item, progress } : item,
+          await api.upload(
+            connection.id,
+            prefix,
+            file,
+            (progress) =>
+              setActivities((current) =>
+                current.map((item) =>
+                  item.id === id
+                    ? {
+                        ...item,
+                        progress: Math.min(progress, 99),
+                        phase: "uploading",
+                      }
+                    : item,
+                ),
               ),
-            ),
+            (phase) =>
+              setActivities((current) =>
+                current.map((item) =>
+                  item.id === id ? { ...item, phase } : item,
+                ),
+              ),
+            controller.signal,
           );
           setActivities((current) =>
             current.map((item) =>
               item.id === id
-                ? { ...item, progress: 100, state: "done", finishedAt: Date.now() }
+                ? {
+                    ...item,
+                    progress: 100,
+                    phase: undefined,
+                    state: "done",
+                    finishedAt: Date.now(),
+                  }
                 : item,
             ),
           );
         } catch (err) {
+          const canceled = controller.signal.aborted;
           setActivities((current) =>
             current.map((item) =>
               item.id === id
-                ? { ...item, state: "error", error: errorMessage(err), finishedAt: Date.now() }
+                ? {
+                    ...item,
+                    state: canceled ? "canceled" : "error",
+                    error: canceled ? "Canceled" : errorMessage(err),
+                    finishedAt: Date.now(),
+                  }
                 : item,
             ),
           );
+        } finally {
+          uploadControllers.current.delete(id);
         }
       }),
     );
@@ -1575,7 +1515,9 @@ function Explorer({
         </button>
         <DownloadMenu
           onDownload={downloadArchive}
-          disabled={Array.from(selected).some((key) => key.startsWith("multipart:"))}
+          disabled={Array.from(selected).some((key) =>
+            key.startsWith("multipart:"),
+          )}
         />
         <button
           type="button"
@@ -1595,7 +1537,9 @@ function Explorer({
                   setSelected(
                     (current) =>
                       new Set(
-                        [...current].filter((key) => !selectableKeys.includes(key)),
+                        [...current].filter(
+                          (key) => !selectableKeys.includes(key),
+                        ),
                       ),
                   )
               : selectAll
@@ -1641,7 +1585,9 @@ function Explorer({
                 type="button"
                 className="active"
                 aria-pressed="true"
-                onClick={() => onFilterChange({ ...itemFilter, folders: false })}
+                onClick={() =>
+                  onFilterChange({ ...itemFilter, folders: false })
+                }
               >
                 Folders
               </button>
@@ -1651,7 +1597,9 @@ function Explorer({
                 type="button"
                 className="active"
                 aria-pressed="true"
-                onClick={() => onFilterChange({ ...itemFilter, multipart: false })}
+                onClick={() =>
+                  onFilterChange({ ...itemFilter, multipart: false })
+                }
               >
                 Multipart
               </button>
@@ -1705,46 +1653,42 @@ function Explorer({
           )}
         </label>
       </div>
-      {multipartLoading && itemFilter.multipart && (
-        <p className="filtered-empty">Checking for incomplete multipart uploads…</p>
-      )}
       {multipartError && itemFilter.multipart && (
-        <p className="form-error" role="alert">
-          Unable to list incomplete multipart uploads: {multipartError}
-        </p>
+        <div className="table row table-message form-error" role="alert">
+          <span />
+          <span>
+            Unable to list incomplete multipart uploads: {multipartError}
+          </span>
+          <span />
+          <span />
+          <span />
+        </div>
       )}
-      {!multipartLoading && !multipartError && visibleMultipartUploads.map((upload) => (
-        <MultipartUploadRow
-          key={upload.uploadId}
-          upload={upload}
-          selected={selected.has(multipartSelectionKey(upload))}
-          onToggleSelected={() => toggleSelected(multipartSelectionKey(upload))}
-          onAbort={() => setMultipartAbortTarget(upload)}
-        />
-      ))}
-      {visibleItems.map((item) => (
-        <ExplorerRow
-          key={item.key}
-          item={item}
-          connection={connection}
-          onBrowse={onBrowse}
-          onRefresh={onRefresh}
-          onError={onError}
-          onDelete={() => setDeleteTarget(item)}
-          selected={selected.has(item.key)}
-          onToggleSelected={toggleSelected}
-          onSelectFromRow={selectFromRow}
-        />
-      ))}
-      {!visibleItems.length &&
-        !visibleMultipartUploads.length &&
+      {!multipartError &&
+        tableRows.map((row) => (
+          <BucketTableRow
+            key={row.type === "object" ? row.item.key : row.upload.uploadId}
+            row={row}
+            connection={connection}
+            onBrowse={onBrowse}
+            onRefresh={onRefresh}
+            onError={onError}
+            onDelete={(item) => setDeleteTarget(item)}
+            selected={selected}
+            onToggleSelected={toggleSelected}
+            onSelectFromRow={selectFromRow}
+            onAbort={(upload) => setMultipartAbortTarget(upload)}
+          />
+        ))}
+      {!multipartLoading &&
+        !tableRows.length &&
         (items.length > 0 || itemFilter.multipart) && (
-        <p className="filtered-empty">
-          {itemFilter.multipart && !itemFilter.files && !itemFilter.folders
-            ? "No incomplete multipart uploads in this location."
-            : "No matching items in this location."}
-        </p>
-      )}
+          <p className="filtered-empty">
+            {itemFilter.multipart && !itemFilter.files && !itemFilter.folders
+              ? "No incomplete multipart uploads in this location."
+              : "No matching items in this location."}
+          </p>
+        )}
       {hasMore && (
         <button
           type="button"
@@ -1789,7 +1733,12 @@ function Explorer({
               setActivities((current) =>
                 current.map((item) =>
                   item.id === id
-                    ? { ...item, progress: 100, state: "done", finishedAt: Date.now() }
+                    ? {
+                        ...item,
+                        progress: 100,
+                        state: "done",
+                        finishedAt: Date.now(),
+                      }
                     : item,
                 ),
               );
@@ -1798,7 +1747,12 @@ function Explorer({
               setActivities((current) =>
                 current.map((item) =>
                   item.id === id
-                    ? { ...item, state: "error", error: errorMessage(err), finishedAt: Date.now() }
+                    ? {
+                        ...item,
+                        state: "error",
+                        error: errorMessage(err),
+                        finishedAt: Date.now(),
+                      }
                     : item,
                 ),
               );
@@ -1809,7 +1763,10 @@ function Explorer({
       {deleteSelectionOpen && (
         <DeleteFileModal
           count={selected.size}
-          multipartCount={Array.from(selected).filter((key) => key.startsWith("multipart:")).length}
+          multipartCount={
+            Array.from(selected).filter((key) => key.startsWith("multipart:"))
+              .length
+          }
           onCancel={() => setDeleteSelectionOpen(false)}
           onConfirm={async () => {
             setDeleteSelectionOpen(false);
@@ -1947,7 +1904,8 @@ function DeleteFileModal({
         <div className="modal-heading">
           <div>
             <span className="eyebrow">
-              {hasMultipart ? "DELETE / ABORT" : "DELETE"} {multiple ? "ITEMS" : item?.kind === "folder" ? "FOLDER" : "FILE"}
+              {hasMultipart ? "DELETE / ABORT" : "DELETE"}{" "}
+              {multiple ? "ITEMS" : item?.kind === "folder" ? "FOLDER" : "FILE"}
             </span>
             <h2>
               {multiple
@@ -1966,12 +1924,17 @@ function DeleteFileModal({
         <p className="modal-description">
           This will permanently delete{" "}
           {multiple ? (
-            hasMultipart
-              ? "the selected files/folders and abort the selected multipart uploads"
-              : "the selected items"
+            hasMultipart ? (
+              "the selected files/folders and abort the selected multipart uploads"
+            ) : (
+              "the selected items"
+            )
           ) : (
             <>
-              <><strong>{item?.name}</strong>{item?.kind === "folder" && " and everything inside it"}</>
+              <>
+                <strong>{item?.name}</strong>
+                {item?.kind === "folder" && " and everything inside it"}
+              </>
             </>
           )}{" "}
           from the bucket. This cannot be undone.
@@ -1981,7 +1944,8 @@ function DeleteFileModal({
             Cancel
           </button>
           <button className="danger" onClick={onConfirm}>
-            {hasMultipart ? "Delete / Abort" : "Delete"} {multiple ? "items" : item?.kind === "folder" ? "folder" : "file"}
+            {hasMultipart ? "Delete / Abort" : "Delete"}{" "}
+            {multiple ? "items" : item?.kind === "folder" ? "folder" : "file"}
           </button>
         </div>
       </div>
@@ -2087,9 +2051,11 @@ function AbortMultipartModal({
 
 function ActivityTray({
   activities,
+  onCancel,
   onDismiss,
 }: {
   activities: Activity[];
+  onCancel: (id: string) => void;
   onDismiss: (id: string) => void;
 }) {
   const [minimized, setMinimized] = useState(false);
@@ -2133,6 +2099,15 @@ function ActivityTray({
                     ×
                   </button>
                 )}
+                {activity.state === "active" && activity.kind === "upload" && (
+                  <button
+                    className="activity-dismiss"
+                    onClick={() => onCancel(activity.id)}
+                    aria-label={`Cancel upload ${activity.label}`}
+                  >
+                    ×
+                  </button>
+                )}
               </div>
               <div className="activity-progress">
                 <span
@@ -2144,7 +2119,11 @@ function ActivityTray({
               <small>
                 {activity.state === "active" ? (
                   activity.kind === "upload" ? (
-                    `${activity.progress}%`
+                    activity.phase === "finalizing" ? (
+                      "Finalizing upload…"
+                    ) : (
+                      `${activity.progress}%`
+                    )
                   ) : (
                     "Working…"
                   )
@@ -2152,6 +2131,8 @@ function ActivityTray({
                   <>
                     <Check size={13} /> Complete
                   </>
+                ) : activity.state === "canceled" ? (
+                  "Canceled"
                 ) : (
                   activity.error || "Failed"
                 )}
@@ -2161,6 +2142,60 @@ function ActivityTray({
         </div>
       )}
     </div>
+  );
+}
+
+type BucketTableRow =
+  | { type: "object"; item: Item }
+  | { type: "multipart"; upload: MultipartUpload };
+
+function BucketTableRow({
+  row,
+  connection,
+  onBrowse,
+  onRefresh,
+  onError,
+  onDelete,
+  selected,
+  onToggleSelected,
+  onSelectFromRow,
+  onAbort,
+}: {
+  row: BucketTableRow;
+  connection: Connection;
+  onBrowse: (connection: Connection, prefix?: string) => void;
+  onRefresh: () => Promise<void>;
+  onError: ErrorHandler;
+  onDelete: (item: Item) => void;
+  selected: Set<string>;
+  onToggleSelected: (key: string) => void;
+  onSelectFromRow: (key: string, event: React.MouseEvent) => boolean;
+  onAbort: (upload: MultipartUpload) => void;
+}) {
+  if (row.type === "multipart") {
+    return (
+      <MultipartUploadRow
+        upload={row.upload}
+        selected={selected.has(multipartSelectionKey(row.upload))}
+        onToggleSelected={() =>
+          onToggleSelected(multipartSelectionKey(row.upload))
+        }
+        onAbort={() => onAbort(row.upload)}
+      />
+    );
+  }
+  return (
+    <ExplorerRow
+      item={row.item}
+      connection={connection}
+      onBrowse={onBrowse}
+      onRefresh={onRefresh}
+      onError={onError}
+      onDelete={() => onDelete(row.item)}
+      selected={selected.has(row.item.key)}
+      onToggleSelected={onToggleSelected}
+      onSelectFromRow={onSelectFromRow}
+    />
   );
 }
 
@@ -2206,7 +2241,13 @@ type RowAction = {
   onSelect: () => void | Promise<void>;
 };
 
-function RowActionMenu({ label, actions }: { label: string; actions: RowAction[] }) {
+function RowActionMenu({
+  label,
+  actions,
+}: {
+  label: string;
+  actions: RowAction[];
+}) {
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLSpanElement>(null);
 
@@ -2294,7 +2335,8 @@ function ExplorerRow({
   const [versions, setVersions] = useState<ObjectVersion[]>([]);
   const [versionsLoading, setVersionsLoading] = useState(false);
   const [versionsError, setVersionsError] = useState("");
-  const [deleteVersionTarget, setDeleteVersionTarget] = useState<ObjectVersion>();
+  const [deleteVersionTarget, setDeleteVersionTarget] =
+    useState<ObjectVersion>();
 
   async function toggleVersions() {
     if (versionsOpen) {
@@ -2319,7 +2361,9 @@ function ExplorerRow({
     try {
       await api.deleteVersion(connection.id, deleteVersionTarget);
       setVersions((current) =>
-        current.filter((version) => version.versionId !== deleteVersionTarget.versionId),
+        current.filter(
+          (version) => version.versionId !== deleteVersionTarget.versionId,
+        ),
       );
       setDeleteVersionTarget(undefined);
       onRefresh();
@@ -2399,7 +2443,7 @@ function ExplorerRow({
           aria-label={`Select ${item.name}`}
         />
         <span>
-          {item.kind === "folder" ? <Folder size={18} /> : <File size={18} />} {" "}
+          {item.kind === "folder" ? <Folder size={18} /> : <File size={18} />}{" "}
           {item.name}
         </span>
         <span>{item.kind}</span>
@@ -2431,20 +2475,24 @@ function ExplorerRow({
               {versions.map((version) => (
                 <div className="version-row" key={version.versionId}>
                   <code title={version.versionId}>
-                    {version.versionId === "null" ? "Unversioned" : version.versionId}
+                    {version.versionId === "null"
+                      ? "Unversioned"
+                      : version.versionId}
                   </code>
                   <span>{new Date(version.lastModified).toLocaleString()}</span>
                   <span>
-                    {version.deleteMarker ? "—" : `${(version.size / 1024).toFixed(1)} KB`}
+                    {version.deleteMarker
+                      ? "—"
+                      : `${(version.size / 1024).toFixed(1)} KB`}
                   </span>
                   <span>
                     {version.deleteMarker
                       ? "Delete marker"
                       : version.versionId === "null"
                         ? "Unversioned"
-                      : version.isLatest
-                        ? "Latest"
-                        : "Previous"}
+                        : version.isLatest
+                          ? "Latest"
+                          : "Previous"}
                   </span>
                   <RowActionMenu
                     label={`Actions for version of ${version.key}`}
@@ -2498,12 +2546,16 @@ function DeleteVersionModal({
         <div className="modal-warning">
           <AlertTriangle size={20} aria-hidden="true" />
           <p>
-            This permanently deletes one version of <strong>{version.key}</strong>.
-            This cannot be undone.
+            This permanently deletes one version of{" "}
+            <strong>{version.key}</strong>. This cannot be undone.
           </p>
         </div>
         <p className="modal-description">
-          {version.deleteMarker ? "Delete marker" : version.isLatest ? "Latest version" : "Previous version"}{" "}
+          {version.deleteMarker
+            ? "Delete marker"
+            : version.isLatest
+              ? "Latest version"
+              : "Previous version"}{" "}
           from {new Date(version.lastModified).toLocaleString()}.
         </p>
         <div className="modal-actions">
@@ -2517,8 +2569,4 @@ function DeleteVersionModal({
       </div>
     </div>
   );
-}
-
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : "Something went wrong";
 }

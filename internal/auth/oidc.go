@@ -11,7 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -91,15 +91,18 @@ func discoverLogoutEndpoint(client *http.Client, issuer string) (string, error) 
 }
 func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
 	state := random(18)
+	slog.Info("OIDC login initiated")
 	s.setCookie(w, "mariner_state", state, 600)
 	http.Redirect(w, r, s.OAuth.AuthCodeURL(state), http.StatusFound)
 }
 func (s *Service) Callback(r *http.Request) (User, string, error) {
 	if r.URL.Query().Get("state") != s.cookie(r, "mariner_state") {
+		slog.Warn("OIDC callback rejected", "reason", "invalid_state")
 		return User{}, "", errors.New("invalid OIDC state")
 	}
 	token, err := s.OAuth.Exchange(r.Context(), r.URL.Query().Get("code"))
 	if err != nil {
+		slog.Warn("OIDC code exchange failed", "error", err)
 		return User{}, "", err
 	}
 	raw, ok := token.Extra("id_token").(string)
@@ -107,7 +110,7 @@ func (s *Service) Callback(r *http.Request) (User, string, error) {
 		return User{}, "", errors.New("OIDC provider did not return an ID token")
 	}
 	if s.DebugJWT {
-		log.Printf("oidc: received id_token=%s", raw)
+		slog.Debug("OIDC ID token received", "id_token", raw)
 	}
 	verifyConfig := &oidc.Config{ClientID: s.OAuth.ClientID}
 	if s.AudienceClaim != "aud" {
@@ -115,7 +118,7 @@ func (s *Service) Callback(r *http.Request) (User, string, error) {
 	}
 	idToken, err := s.Provider.Verifier(verifyConfig).Verify(r.Context(), raw)
 	if err != nil {
-		log.Printf("oidc: ID token validation failed (issuer/client/audience/expiry/signature): %v", err)
+		slog.Warn("OIDC ID token validation failed", "error", err)
 		return User{}, "", errors.New("invalid identity token")
 	}
 	var claims map[string]json.RawMessage
@@ -123,15 +126,15 @@ func (s *Service) Callback(r *http.Request) (User, string, error) {
 		return User{}, "", errors.New("identity token has no subject")
 	}
 	if s.DebugJWT {
-		log.Printf("oidc: validated claims=%s", string(mustJSON(claims)))
+		slog.Debug("OIDC claims validated", "claims", string(mustJSON(claims)))
 	}
 	if s.AudienceClaim != "aud" && !contains(claimGroups(claims, s.AudienceClaim), s.Audience) {
-		log.Printf("oidc: audience mismatch claim=%q expected=%q", s.AudienceClaim, s.Audience)
+		slog.Warn("OIDC audience mismatch", "claim", s.AudienceClaim)
 		return User{}, "", errors.New("invalid identity token audience")
 	}
 	sub := claimString(claims, "sub")
 	if sub == "" {
-		log.Printf("oidc: configured subject claim is missing or empty")
+		slog.Warn("OIDC subject claim missing")
 		return User{}, "", errors.New("identity token has no subject")
 	}
 	name := claimString(claims, s.NameClaim)
@@ -139,7 +142,7 @@ func (s *Service) Callback(r *http.Request) (User, string, error) {
 		name = claimString(claims, "email")
 	}
 	if name == "OIDC user" && s.NameClaim != "" {
-		log.Printf("oidc: name claim %q missing; using fallback", s.NameClaim)
+		slog.Debug("OIDC name claim missing; using fallback", "claim", s.NameClaim)
 	}
 	if name == "" {
 		name = claimString(claims, "preferred_username")
@@ -178,6 +181,7 @@ func (s *Service) StartSession(w http.ResponseWriter, id string, user User) {
 	s.sessions[id] = Session{User: user, Expires: time.Now().Add(12 * time.Hour)}
 	s.mu.Unlock()
 	s.setCookie(w, "mariner_session", id, 43200)
+	slog.Info("OIDC session started", "user_id", user.ID)
 }
 func (s *Service) Current(r *http.Request) (Session, string, bool) {
 	id := s.cookie(r, "mariner_session")
@@ -200,6 +204,7 @@ func (s *Service) Logout(w http.ResponseWriter, r *http.Request) {
 	delete(s.sessions, id)
 	s.mu.Unlock()
 	s.setCookie(w, "mariner_session", "", -1)
+	slog.Info("session logged out")
 	if s.LogoutEnabled && s.LogoutEndpoint != "" {
 		logoutURL, err := url.Parse(s.LogoutEndpoint)
 		if err == nil {
@@ -209,7 +214,7 @@ func (s *Service) Logout(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, logoutURL.String(), http.StatusFound)
 			return
 		}
-		log.Printf("oidc logout redirect unavailable: %v", err)
+		slog.Warn("OIDC logout redirect unavailable", "error", err)
 	}
 	http.Redirect(w, r, "/", http.StatusFound)
 }

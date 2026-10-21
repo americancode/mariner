@@ -3,7 +3,7 @@ package tlsconfig
 import (
 	"crypto/x509"
 	"encoding/pem"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,7 +75,7 @@ func appendFile(pool *x509.CertPool, file string) error {
 		return os.ErrInvalid
 	}
 	if strings.TrimSpace(string(data)) != "" {
-		log.Printf("tls: appended %d certificates from %s", certs, file)
+		slog.Debug("custom CA certificates loaded", "count", certs, "file", file)
 	}
 	return nil
 }

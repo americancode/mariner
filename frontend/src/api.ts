@@ -1,3 +1,5 @@
+import { csrfToken } from "./utils/csrf";
+
 export type Connection = {
   id: string;
   name: string;
@@ -6,7 +8,6 @@ export type Connection = {
   prefix: string;
   endpoint?: string;
 };
-
 export type Item = {
   name: string;
   key: string;
@@ -49,7 +50,10 @@ export type AuditEvent = {
   file_sha256?: string;
   error?: string;
 };
-export type OrganizationConnection = Connection & { accessKey?: string; secretKey?: string };
+export type OrganizationConnection = Connection & {
+  accessKey?: string;
+  secretKey?: string;
+};
 export type Organization = {
   id: string;
   name: string;
@@ -57,15 +61,23 @@ export type Organization = {
   provisioned: boolean;
   connections: Record<string, OrganizationConnection>;
 };
+export type ApplicationSettings = { archiveMaxBytes: number };
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const method = (init?.method ?? "GET").toUpperCase();
+  const headers = new Headers(init?.headers);
+  if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+    const token = csrfToken();
+    if (token) headers.set("X-CSRF-Token", token);
+  }
+  const response = await fetch(url, { ...init, headers });
   const body = response.ok ? "" : await response.text();
 
   if (!response.ok) {
     const needsLogin =
-      response.status === 401 ||
-      (response.status === 423 && body.includes("sign in required"));
+      url !== "/api/vault/unlock" &&
+      ((response.status === 401 && body.includes("sign in required")) ||
+        (response.status === 423 && body.includes("sign in required")));
     if (needsLogin) {
       window.location.assign(
         `/auth/login?return=${encodeURIComponent(window.location.pathname + window.location.search)}`,
@@ -85,18 +97,55 @@ export const api = {
       "/api/me",
     ),
   audit: (filters: Record<string, string>, offset = 0) => {
-    const params = new URLSearchParams({ ...filters, offset: String(offset), limit: "50" });
-    return request<{ events: AuditEvent[]; nextOffset: number; hasMore: boolean }>(
-      `/api/admin/audit?${params}`,
-    );
+    const params = new URLSearchParams({
+      ...filters,
+      offset: String(offset),
+      limit: "50",
+    });
+    return request<{
+      events: AuditEvent[];
+      nextOffset: number;
+      hasMore: boolean;
+    }>(`/api/admin/audit?${params}`);
   },
   auditActions: () => request<string[]>("/api/admin/audit/actions"),
-  adminPreferences: () => request<Record<string, boolean>>("/api/admin/preferences"),
-  updateAdminPreferences: (preferences: Record<string, boolean>) => request<Record<string, boolean>>("/api/admin/preferences", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(preferences) }),
+  adminPreferences: () =>
+    request<Record<string, boolean>>("/api/admin/preferences"),
+  adminSettings: () => request<ApplicationSettings>("/api/admin/settings"),
+  updateAdminSettings: (settings: ApplicationSettings) =>
+    request<ApplicationSettings>("/api/admin/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(settings),
+    }),
+  updateAdminPreferences: (preferences: Record<string, boolean>) =>
+    request<Record<string, boolean>>("/api/admin/preferences", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(preferences),
+    }),
   adminOrganizations: () => request<Organization[]>("/api/admin/organizations"),
-  createOrganization: (organization: Organization) => request<Organization>("/api/admin/organizations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(organization) }),
-  updateOrganization: (organization: Organization) => request<Organization>("/api/admin/organizations", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(organization) }),
-  deleteOrganization: (id: string) => request<void>(`/api/admin/organizations?id=${encodeURIComponent(id)}`, { method: "DELETE" }),
+  createOrganization: (organization: Organization) =>
+    request<Organization>("/api/admin/organizations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(organization),
+    }),
+  updateOrganization: (organization: Organization) =>
+    request<Organization>("/api/admin/organizations", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(organization),
+    }),
+  deleteOrganization: (id: string) =>
+    request<void>(`/api/admin/organizations?id=${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+  logout: () =>
+    fetch("/auth/logout", {
+      method: "POST",
+      headers: { "X-CSRF-Token": csrfToken() },
+    }),
   status: () => request<{ exists: boolean }>("/api/vault/status"),
   unlock: async (password: string) => {
     const controller = new AbortController();
@@ -135,15 +184,21 @@ export const api = {
     nextToken = "",
   ) =>
     request<BrowseResponse>(
-      `/api/browse?connection=${id}&prefix=${encodeURIComponent(prefix)}&kind=${kind}${nextToken ? `&continuationToken=${encodeURIComponent(nextToken)}` : ""}`,
+      `/api/browse?connection=${encodeURIComponent(id)}&prefix=${encodeURIComponent(prefix)}&kind=${kind}${nextToken ? `&continuationToken=${encodeURIComponent(nextToken)}` : ""}`,
     ),
-  search: (id: string, prefix: string, query: string, kind: BrowseKind = "all") =>
+  search: (
+    id: string,
+    prefix: string,
+    query: string,
+    kind: BrowseKind = "all",
+  ) =>
     request<BrowseResponse>(
-      `/api/search?connection=${id}&prefix=${encodeURIComponent(prefix)}&query=${encodeURIComponent(query)}&kind=${kind}`,
+      `/api/search?connection=${encodeURIComponent(id)}&prefix=${encodeURIComponent(prefix)}&query=${encodeURIComponent(query)}&kind=${kind}`,
     ),
-  multipartUploads: (id: string, prefix = "") =>
+  multipartUploads: (id: string, prefix = "", signal?: AbortSignal) =>
     request<{ uploads: MultipartUpload[] }>(
       `/api/multipart?connection=${encodeURIComponent(id)}&prefix=${encodeURIComponent(prefix)}`,
+      { signal },
     ),
   abortMultipart: (id: string, upload: MultipartUpload) =>
     request<void>(
@@ -192,14 +247,17 @@ export const api = {
       },
     ),
   deleteFile: (id: string, key: string) =>
-    request<void>(`/api/file?connection=${id}&key=${encodeURIComponent(key)}`, {
-      method: "DELETE",
-    }),
+    request<void>(
+      `/api/file?connection=${encodeURIComponent(id)}&key=${encodeURIComponent(key)}`,
+      {
+        method: "DELETE",
+      },
+    ),
   fileUrl: (id: string, key: string, versionId?: string) =>
     `/api/file?connection=${encodeURIComponent(id)}&key=${encodeURIComponent(key)}${versionId ? `&versionId=${encodeURIComponent(versionId)}` : ""}`,
   download: (id: string, prefix: string, format: "zip" | "tgz") =>
     fetch(
-      `/api/download?connection=${id}&prefix=${encodeURIComponent(prefix)}&format=${format}`,
+      `/api/download?connection=${encodeURIComponent(id)}&prefix=${encodeURIComponent(prefix)}&format=${format}`,
     ).then(async (response) => {
       if (!response.ok) throw new Error(await response.text());
       return response.blob();
@@ -209,11 +267,17 @@ export const api = {
     prefix: string,
     file: File,
     onProgress?: (value: number) => void,
+    onPhase?: (phase: "uploading" | "finalizing") => void,
+    signal?: AbortSignal,
   ) =>
     (async () => {
-      const { uploadId, key } = await request<{ uploadId: string; key: string }>(
-        "/api/upload/init",
-        {
+      if (file.size > 32 * 1024 * 1024) {
+        const { uploadId, key, partSize, concurrency } = await request<{
+          uploadId: string;
+          key: string;
+          partSize: number;
+          concurrency: number;
+        }>("/api/upload/init", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -223,45 +287,122 @@ export const api = {
             size: file.size,
             contentType: file.type,
           }),
-        },
-      );
-      const partSize = 16 * 1024 * 1024;
-      try {
-        let partNumber = 1;
-        for (let offset = 0; offset < file.size || (file.size === 0 && partNumber === 1); offset += partSize) {
-          const chunk = file.slice(offset, Math.min(offset + partSize, file.size));
-          await new Promise<void>((resolve, reject) => {
-            const xhr = new XMLHttpRequest();
-            xhr.open(
-              "PUT",
-              `/api/upload/part?connection=${encodeURIComponent(id)}&uploadId=${encodeURIComponent(uploadId)}&partNumber=${partNumber}`,
+        });
+        const configuredPartSize = partSize > 0 ? partSize : 16 * 1024 * 1024;
+        const configuredConcurrency = concurrency > 0 ? concurrency : 1;
+        try {
+          let uploadedBytes = 0;
+          let offset = 0;
+          let partNumber = 1;
+          while (offset < file.size) {
+            const batch: Array<{ partNumber: number; chunk: Blob }> = [];
+            while (batch.length < configuredConcurrency && offset < file.size) {
+              const chunk = file.slice(
+                offset,
+                Math.min(offset + configuredPartSize, file.size),
+              );
+              batch.push({ partNumber, chunk });
+              offset += chunk.size;
+              partNumber += 1;
+            }
+            const batchProgress = new Map<number, number>();
+            await Promise.all(
+              batch.map(
+                ({ partNumber: batchPartNumber, chunk }) =>
+                  new Promise<void>((resolve, reject) => {
+                    const xhr = new XMLHttpRequest();
+                    const abort = () => xhr.abort();
+                    signal?.addEventListener("abort", abort, { once: true });
+                    xhr.open(
+                      "PUT",
+                      `/api/upload/part?connection=${encodeURIComponent(id)}&uploadId=${encodeURIComponent(uploadId)}&partNumber=${batchPartNumber}`,
+                    );
+                    const token = csrfToken();
+                    if (token) xhr.setRequestHeader("X-CSRF-Token", token);
+                    xhr.upload.onprogress = (event) => {
+                      if (event.lengthComputable) {
+                        batchProgress.set(batchPartNumber, event.loaded);
+                        const uploaded =
+                          uploadedBytes +
+                          [...batchProgress.values()].reduce(
+                            (total, value) => total + value,
+                            0,
+                          );
+                        onProgress?.(Math.round((uploaded / file.size) * 100));
+                      }
+                    };
+                    xhr.onload = () => {
+                      signal?.removeEventListener("abort", abort);
+                      if (xhr.status >= 200 && xhr.status < 300) {
+                        uploadedBytes += chunk.size;
+                        resolve();
+                      } else
+                        reject(
+                          new Error(xhr.responseText || "Upload part failed"),
+                        );
+                    };
+                    xhr.onerror = () => {
+                      signal?.removeEventListener("abort", abort);
+                      reject(new Error("Upload part failed"));
+                    };
+                    xhr.onabort = () => {
+                      signal?.removeEventListener("abort", abort);
+                      reject(new DOMException("Upload canceled", "AbortError"));
+                    };
+                    xhr.send(chunk);
+                  }),
+              ),
             );
-            xhr.upload.onprogress = (event) => {
-              if (event.lengthComputable) {
-                const uploaded = offset + event.loaded;
-                onProgress?.(Math.round((uploaded / Math.max(file.size, 1)) * 100));
-              }
-            };
-            xhr.onload = () => {
-              if (xhr.status >= 200 && xhr.status < 300) resolve();
-              else reject(new Error(xhr.responseText || "Upload part failed"));
-            };
-            xhr.onerror = () => reject(new Error("Upload part failed"));
-            xhr.send(chunk);
-          });
-          partNumber += 1;
+          }
+          onPhase?.("finalizing");
+          await request<void>(
+            `/api/upload/complete?connection=${encodeURIComponent(id)}&uploadId=${encodeURIComponent(uploadId)}&key=${encodeURIComponent(key)}`,
+            { method: "POST" },
+          );
+          onProgress?.(100);
+        } catch (error) {
+          await request<void>(
+            `/api/upload?uploadId=${encodeURIComponent(uploadId)}`,
+            { method: "DELETE" },
+          ).catch(() => undefined);
+          throw error;
         }
-        await request<void>(
-          `/api/upload/complete?connection=${encodeURIComponent(id)}&uploadId=${encodeURIComponent(uploadId)}&key=${encodeURIComponent(key)}`,
-          { method: "POST" },
-        );
-        onProgress?.(100);
-      } catch (error) {
-        await request<void>(
-          `/api/upload?uploadId=${encodeURIComponent(uploadId)}`,
-          { method: "DELETE" },
-        ).catch(() => undefined);
-        throw error;
+        return;
       }
+      await new Promise<void>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        const abort = () => xhr.abort();
+        signal?.addEventListener("abort", abort, { once: true });
+        xhr.open(
+          "POST",
+          `/api/upload?connection=${encodeURIComponent(id)}&prefix=${encodeURIComponent(prefix)}`,
+        );
+        const token = csrfToken();
+        if (token) xhr.setRequestHeader("X-CSRF-Token", token);
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) {
+            onProgress?.(
+              Math.round((event.loaded / Math.max(event.total, 1)) * 100),
+            );
+          }
+        };
+        xhr.onload = () => {
+          signal?.removeEventListener("abort", abort);
+          if (xhr.status >= 200 && xhr.status < 300) resolve();
+          else reject(new Error(xhr.responseText || "Upload failed"));
+        };
+        xhr.onerror = () => {
+          signal?.removeEventListener("abort", abort);
+          reject(new Error("Upload failed"));
+        };
+        xhr.onabort = () => {
+          signal?.removeEventListener("abort", abort);
+          reject(new DOMException("Upload canceled", "AbortError"));
+        };
+        const body = new FormData();
+        body.append("file", file, file.name);
+        xhr.send(body);
+      });
+      onProgress?.(100);
     })(),
 };

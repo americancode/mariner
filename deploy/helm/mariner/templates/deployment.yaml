@@ -18,7 +18,7 @@ spec:
       {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
       {{- end }}
-        {{- $configValues := dict "database" .Values.database "audit" .Values.audit "oidc" .Values.oidc "organizations" .Values.organizations }}
+        {{- $configValues := dict "database" .Values.database "audit" .Values.audit "oidc" .Values.oidc "organizations" .Values.organizations "timezone" .Values.timezone "upload" .Values.upload }}
         checksum/config-values: {{ toJson $configValues | sha256sum }}
     spec:
       serviceAccountName: {{ include "mariner.serviceAccountName" . }}

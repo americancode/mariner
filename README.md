@@ -20,11 +20,65 @@ For frontend development, run `cd frontend && npm install && npm run dev`. The p
 
 The OIDC client defaults to requesting the `openid`, `profile`, and `email` scopes and uses the callback URL above. Helm deployments can replace this list with `oidc.scopes`. `DATA_DIR` defaults to `./data`; it contains the SQLite database `mariner.db`, with encrypted vault envelopes keyed by user. Back it up with appropriate permissions. On first sign-in, choose a master password of at least 10 characters. The server cannot recover it.
 
+Rate limiting is configured through the Helm chart rather than hard-coded in
+the deployment. The defaults limit login, vault unlock, and connection-test
+requests per process-local time window:
+
+```yaml
+rateLimit:
+  enabled: true
+  window: 1m
+  loginPerWindow: 10
+  unlockPerWindow: 10
+  connectionTestPerWindow: 30
+```
+
+For multiple replicas, use an ingress or gateway rate limiter for a shared
+global limit; the application limiter is intentionally process-local.
+
+Application logs are structured JSON on stdout. Configure the verbosity in
+Helm with `logging.level: debug`, `info`, `warn`, or `error`.
+
 ### Database and audit storage
 
 PostgreSQL is the default storage backend in the Helm chart. Set `database.driver: sqlite` for lightweight single-replica deployments. PostgreSQL requires either `DATABASE_URL` or the chart's field-based Secret selectors. Both schemas store the same encrypted vault envelope, so the master password is never stored by Mariner. The Helm chart supports `database.driver`, `database.url`, and `database.existingSecret`.
 
 The application Helm chart does not deploy a PostgreSQL server; it consumes an external PostgreSQL endpoint or Secret. The local Kustomize environment deploys separate PostgreSQL instances for Keycloak in `infra` and Mariner in `mariner`.
+
+Administrators can configure the maximum total size of generated ZIP and TGZ
+downloads from the administration overview. It defaults to 5 GiB and is
+stored in the application settings repository, so the setting applies across
+restarts and database backends.
+
+#### Schema migrations
+
+Mariner uses versioned Goose SQL migrations. The application embeds the files
+from `internal/database/migrations` and applies pending migrations during
+database startup. Existing databases are adopted by the initial migration
+without dropping their tables; Goose records applied versions in
+`goose_db_version`.
+
+The production image also includes the Goose CLI and migration files at
+`/usr/local/bin/goose` and `/migrations`. For an operational migration run:
+
+```sh
+goose -dir /migrations postgres "$DATABASE_URL" up
+goose -dir /migrations postgres "$DATABASE_URL" status
+goose -dir /migrations postgres "$DATABASE_URL" down
+```
+
+For a SQLite data directory:
+
+```sh
+goose -dir /migrations sqlite3 /data/mariner.db up
+```
+
+Create each new migration with Goose and review both directions before
+shipping it. Schema changes are not generated automatically from Go models:
+
+```sh
+goose -dir internal/database/migrations create add_example_column sql
+```
 
 For a Secret with individually named fields:
 

@@ -5,6 +5,7 @@ metadata:
   labels:
     {{- include "mariner.labels" . | nindent 4 }}
 data:
+  TZ: {{ default "UTC" .Values.timezone | quote }}
   DATABASE_DRIVER: {{ default "postgres" .Values.database.driver | quote }}
   AUDIT_ENABLED: {{ default true .Values.audit.enabled | quote }}
   AUDIT_ADMIN_GROUP: {{ default (default "admins" .Values.audit.adminGroup) .Values.oidc.adminGroup | quote }}
@@ -18,6 +19,14 @@ data:
   OIDC_AUDIENCE: {{ default .Values.oidc.clientId .Values.oidc.audience | quote }}
   OIDC_NAME_CLAIM: {{ default "name" .Values.oidc.nameClaim | quote }}
   OIDC_DEBUG_JWT: {{ default false .Values.oidc.debugJwt | quote }}
+  RATE_LIMIT_ENABLED: {{ default true .Values.rateLimit.enabled | quote }}
+  RATE_LIMIT_WINDOW: {{ default "1m" .Values.rateLimit.window | quote }}
+  RATE_LIMIT_LOGIN: {{ default 10 .Values.rateLimit.loginPerWindow | quote }}
+  RATE_LIMIT_UNLOCK: {{ default 10 .Values.rateLimit.unlockPerWindow | quote }}
+  RATE_LIMIT_CONNECTION_TEST: {{ default 30 .Values.rateLimit.connectionTestPerWindow | quote }}
+  UPLOAD_PART_SIZE: {{ default 16777216 .Values.upload.multipart.partSize | quote }}
+  UPLOAD_PART_CONCURRENCY: {{ default 1 .Values.upload.multipart.concurrency | quote }}
+  LOG_LEVEL: {{ default "info" .Values.logging.level | quote }}
   {{- $organizations := dict }}
   {{- range $organizationName, $configuredOrg := .Values.organizations }}
   {{- $org := $configuredOrg }}

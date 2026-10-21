@@ -18,7 +18,7 @@ func TestWritePersistsCanonicalJSONToDatabase(t *testing.T) {
 	}
 	defer store.Close()
 
-	logger := New(store)
+	logger := New(store.AuditRepository())
 	event := vault.AuditEvent{ID: "event-1", OccurredAt: "2026-08-31T18:00:00Z", Action: "connection.create", Result: "success", UserID: "user-1"}
 	if err = logger.Write(event); err != nil {
 		t.Fatal(err)

@@ -1,47 +1,59 @@
 package httpapi
 
 import (
-	"archive/tar"
-	"archive/zip"
-	"bytes"
-	"compress/gzip"
-	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/go-chi/chi/v5"
 	"mariner/internal/audit"
 	"mariner/internal/auth"
 	"mariner/internal/config"
-	s3client "mariner/internal/s3"
+	connectioncontroller "mariner/internal/httpapi/controller"
+	"mariner/internal/httpapi/mapper"
+	"mariner/internal/model"
+	"mariner/internal/repository"
+	s3service "mariner/internal/service/s3"
 	"mariner/internal/vault"
 )
 
 type Server struct {
-	Auth            *auth.Service
-	Vault           *vault.Store
-	Audit           *audit.Logger
-	AuditAdminGroup string
-	Organizations   map[string]config.Organization
-	uploadMu        sync.Mutex
-	uploads         map[string]*uploadState
+	Auth                    *auth.Service
+	Vault                   *vault.Store
+	AuditRepo               repository.AuditEventRepository
+	OrganizationRepo        repository.OrganizationRepository
+	PreferenceRepo          repository.UserPreferenceRepository
+	ApplicationSettingsRepo repository.ApplicationSettingsRepository
+	Storage                 *s3service.Service
+	Audit                   *audit.Logger
+	AuditAdminGroup         string
+	Organizations           map[string]config.Organization
+	Connections             connectioncontroller.ConnectionUseCase
+	ConnectionCtrl          *connectioncontroller.ConnectionController
+	uploadMu                sync.Mutex
+	uploads                 map[string]*uploadState
+	limiter                 *rateLimiter
+	RateLimitEnabled        bool
+	RateLimitWindow         time.Duration
+	LoginRateLimit          int
+	UnlockRateLimit         int
+	ConnectionTestRateLimit int
+	UploadPartSize          int64
+	UploadPartConcurrency   int
 }
 
 type uploadState struct {
@@ -50,9 +62,9 @@ type uploadState struct {
 	Bucket     string
 	Key        string
 	UploadID   string
-	Hash       hash.Hash
-	Parts      []types.CompletedPart
-	NextPart   int32
+	Parts      map[int32]model.UploadPart
+	PartPaths  map[int32]string
+	TempDir    string
 }
 
 func (s *Server) audit(session auth.Session, action, result string, fields map[string]string) {
@@ -77,21 +89,49 @@ func (s *Server) audit(session auth.Session, action, result string, fields map[s
 		}
 	}
 	if err := s.Audit.Write(event); err != nil {
-		log.Printf("audit write failed action=%s: %v", action, err)
+		slog.Error("audit write failed", "action", action, "error", err)
 	}
 }
 
+func (s *Server) auditRepository() repository.AuditEventRepository {
+	if s.AuditRepo != nil {
+		return s.AuditRepo
+	}
+	return s.Vault.AuditRepository()
+}
+
+func (s *Server) organizationRepository() repository.OrganizationRepository {
+	if s.OrganizationRepo != nil {
+		return s.OrganizationRepo
+	}
+	return s.Vault.OrganizationRepository()
+}
+
+func (s *Server) preferenceRepository() repository.UserPreferenceRepository {
+	if s.PreferenceRepo != nil {
+		return s.PreferenceRepo
+	}
+	return s.Vault.UserPreferenceRepository()
+}
+
 func (s *Server) Router() http.Handler {
+	if s.limiter == nil {
+		s.limiter = &rateLimiter{entries: map[string]rateWindow{}}
+	}
 	r := chi.NewRouter()
+	r.Use(s.securityMiddleware)
+	r.Use(s.sensitiveRateLimit)
 	r.Get("/auth/login", s.login)
 	r.Get("/auth/callback", s.callback)
-	r.Get("/auth/logout", s.logout)
+	r.Post("/auth/logout", s.logout)
 	r.Get("/api/healthz", s.healthz)
 	r.Get("/api/me", s.me)
 	r.Get("/api/admin/audit", s.adminAudit)
 	r.Get("/api/admin/audit/actions", s.adminAuditActions)
 	r.Get("/api/admin/preferences", s.adminPreferences)
 	r.Put("/api/admin/preferences", s.updateAdminPreferences)
+	r.Get("/api/admin/settings", s.adminSettings)
+	r.Put("/api/admin/settings", s.updateAdminSettings)
 	r.Get("/api/admin/organizations", s.adminOrganizations)
 	r.Post("/api/admin/organizations", s.createAdminOrganization)
 	r.Put("/api/admin/organizations", s.updateAdminOrganization)
@@ -102,11 +142,11 @@ func (s *Server) Router() http.Handler {
 	r.Delete("/api/vault", s.destroyVault)
 	r.Get("/api/settings", s.settings)
 	r.Put("/api/settings", s.updateSettings)
-	r.Get("/api/connections", s.connections)
-	r.Post("/api/connections", s.addConnection)
-	r.Post("/api/connections/test", s.testConnection)
-	r.Put("/api/connections", s.updateConnection)
-	r.Delete("/api/connections", s.deleteConnection)
+	r.Get("/api/connections", s.connectionController().List)
+	r.Post("/api/connections", s.connectionController().Create)
+	r.Post("/api/connections/test", s.connectionController().Test)
+	r.Put("/api/connections", s.connectionController().Update)
+	r.Delete("/api/connections", s.connectionController().Delete)
 	r.Post("/api/folders", s.createFolder)
 	r.Get("/api/browse", s.browse)
 	r.Get("/api/search", s.search)
@@ -148,7 +188,7 @@ func (s *Server) adminAudit(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	start, end := auditTimeBoundary(r.URL.Query().Get("start"), false), auditTimeBoundary(r.URL.Query().Get("end"), true)
-	page, err := s.Vault.ListAudit(vault.AuditFilter{
+	page, err := s.auditRepository().List(vault.AuditFilter{
 		User:   r.URL.Query().Get("user"),
 		Bucket: r.URL.Query().Get("bucket"),
 		Action: r.URL.Query().Get("action"),
@@ -169,7 +209,7 @@ func (s *Server) adminAuditActions(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusForbidden, errors.New("administrator access required"))
 		return
 	}
-	actions, err := s.Vault.ListAuditActions()
+	actions, err := s.auditRepository().ListActions()
 	if err != nil {
 		fail(w, http.StatusInternalServerError, err)
 		return
@@ -182,12 +222,51 @@ func (s *Server) adminPreferences(w http.ResponseWriter, r *http.Request) {
 		fail(w, 403, errors.New("administrator access required"))
 		return
 	}
-	preferences, err := s.Vault.GetUserPreferences(session.User.ID)
+	preferences, err := s.preferenceRepository().Get(session.User.ID)
 	if err != nil {
 		fail(w, 500, err)
 		return
 	}
 	write(w, preferences)
+}
+
+func (s *Server) applicationSettingsRepository() repository.ApplicationSettingsRepository {
+	if s.ApplicationSettingsRepo != nil {
+		return s.ApplicationSettingsRepo
+	}
+	return s.Vault.ApplicationSettingsRepository()
+}
+
+func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.adminAllowed(r); !ok {
+		fail(w, http.StatusForbidden, errors.New("administrator access required"))
+		return
+	}
+	settings, err := s.applicationSettingsRepository().Get()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	write(w, settings)
+}
+
+func (s *Server) updateAdminSettings(w http.ResponseWriter, r *http.Request) {
+	session, ok := s.adminAllowed(r)
+	if !ok {
+		fail(w, http.StatusForbidden, errors.New("administrator access required"))
+		return
+	}
+	var settings model.ApplicationSettings
+	if err := DecodeJSON(w, r, &settings); err != nil || settings.ArchiveMaxBytes <= 0 {
+		fail(w, http.StatusBadRequest, errors.New("archive max bytes must be positive"))
+		return
+	}
+	if err := s.applicationSettingsRepository().Save(settings); err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.audit(session, "application-settings.update", "success", nil)
+	write(w, settings)
 }
 func (s *Server) updateAdminPreferences(w http.ResponseWriter, r *http.Request) {
 	session, ok := s.adminAllowed(r)
@@ -196,11 +275,11 @@ func (s *Server) updateAdminPreferences(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	preferences := map[string]bool{}
-	if json.NewDecoder(r.Body).Decode(&preferences) != nil {
+	if DecodeJSON(w, r, &preferences) != nil {
 		fail(w, 400, errors.New("invalid preferences"))
 		return
 	}
-	if err := s.Vault.SaveUserPreferences(session.User.ID, preferences); err != nil {
+	if err := s.preferenceRepository().Save(session.User.ID, preferences); err != nil {
 		fail(w, 500, err)
 		return
 	}
@@ -216,7 +295,7 @@ func (s *Server) adminOrganizations(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusForbidden, errors.New("administrator access required"))
 		return
 	}
-	organizations, err := s.Vault.ListOrganizations()
+	organizations, err := s.organizationRepository().List()
 	if err != nil {
 		fail(w, 500, err)
 		return
@@ -244,7 +323,7 @@ func (s *Server) saveAdminOrganization(w http.ResponseWriter, r *http.Request, u
 		return
 	}
 	var organization vault.Organization
-	if json.NewDecoder(r.Body).Decode(&organization) != nil || organization.ID == "" || organization.Name == "" {
+	if DecodeJSON(w, r, &organization) != nil || organization.ID == "" || organization.Name == "" {
 		fail(w, 400, errors.New("organization id and name are required"))
 		return
 	}
@@ -253,7 +332,7 @@ func (s *Server) saveAdminOrganization(w http.ResponseWriter, r *http.Request, u
 		return
 	}
 	if update {
-		stored, err := s.Vault.ListOrganizations()
+		stored, err := s.organizationRepository().List()
 		if err != nil {
 			fail(w, 500, err)
 			return
@@ -272,7 +351,7 @@ func (s *Server) saveAdminOrganization(w http.ResponseWriter, r *http.Request, u
 		}
 		organization.Connections[name] = connection
 	}
-	if err := s.Vault.SaveOrganization(organization); err != nil {
+	if err := s.organizationRepository().Save(organization); err != nil {
 		fail(w, 500, err)
 		return
 	}
@@ -294,8 +373,8 @@ func (s *Server) deleteAdminOrganization(w http.ResponseWriter, r *http.Request)
 		fail(w, 409, errors.New("Helm-provisioned organizations are read-only"))
 		return
 	}
-	if err := s.Vault.DeleteOrganization(id); err != nil {
-		log.Printf("admin organization database delete failed error=%v", err)
+	if err := s.organizationRepository().Delete(id); err != nil {
+		slog.Error("admin organization database delete failed", "error", err)
 		fail(w, 500, err)
 		return
 	}
@@ -336,7 +415,8 @@ func auditTimeBoundary(value string, end bool) string {
 func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 	user, id, err := s.Auth.Callback(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
+		slog.Warn("authentication failure: OIDC callback rejected", "error", err)
+		fail(w, http.StatusUnauthorized, errors.New("authentication failed"))
 		return
 	}
 	s.Auth.StartSession(w, id, user)
@@ -401,12 +481,13 @@ func (s *Server) unlock(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		Password string `json:"password"`
 	}
-	if json.NewDecoder(r.Body).Decode(&request) != nil || len(request.Password) < 10 {
+	if DecodeJSON(w, r, &request) != nil || len(request.Password) < 10 {
 		fail(w, 400, errors.New("master password must be at least 10 characters"))
 		return
 	}
 	data, exists, err := s.Vault.Load(session.User.ID, request.Password)
 	if err != nil {
+		s.audit(session, "vault.unlock", "error", map[string]string{"error": "invalid master password"})
 		fail(w, 401, err)
 		return
 	}
@@ -445,14 +526,6 @@ func (s *Server) destroyVault(w http.ResponseWriter, r *http.Request) {
 	s.audit(session, "vault.destroy", "success", nil)
 	write(w, map[string]bool{"ok": true})
 }
-func (s *Server) connections(w http.ResponseWriter, r *http.Request) {
-	session, _, data, err := s.unlocked(r)
-	if err != nil {
-		fail(w, 423, err)
-		return
-	}
-	write(w, publicConnections(s.withOrganizations(session.User, data)))
-}
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	_, _, data, err := s.unlocked(r)
 	if err != nil {
@@ -468,7 +541,7 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var settings vault.Settings
-	if json.NewDecoder(r.Body).Decode(&settings) != nil || (settings.Theme != "light" && settings.Theme != "dark") {
+	if DecodeJSON(w, r, &settings) != nil || (settings.Theme != "light" && settings.Theme != "dark") {
 		fail(w, 400, errors.New("theme must be light or dark"))
 		return
 	}
@@ -480,138 +553,6 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	write(w, settings)
 	s.audit(session, "settings.update", "success", nil)
 }
-func (s *Server) addConnection(w http.ResponseWriter, r *http.Request) {
-	session, _, data, err := s.unlocked(r)
-	if err != nil {
-		fail(w, 423, err)
-		return
-	}
-	var c vault.Connection
-	if json.NewDecoder(r.Body).Decode(&c) != nil || c.Name == "" || c.Bucket == "" {
-		fail(w, 400, errors.New("name and bucket are required"))
-		return
-	}
-	if err := validateS3Connection(r.Context(), c); err != nil {
-		fail(w, http.StatusBadRequest, fmt.Errorf("connection test failed: %w", err))
-		return
-	}
-	c.ID = randomID()
-	data.Connections = append(data.Connections, c)
-	if err = s.Vault.Save(session.User.ID, session.Password, data); err != nil {
-		fail(w, 500, err)
-		return
-	}
-	write(w, map[string]string{"id": c.ID})
-	s.audit(session, "connection.create", "success", map[string]string{"connection_id": c.ID, "bucket": c.Bucket})
-}
-func (s *Server) testConnection(w http.ResponseWriter, r *http.Request) {
-	var c vault.Connection
-	if json.NewDecoder(r.Body).Decode(&c) != nil || c.Bucket == "" {
-		fail(w, http.StatusBadRequest, errors.New("bucket is required"))
-		return
-	}
-	_, admin := s.adminAllowed(r)
-	var data vault.Data
-	var err error
-	if !(admin && c.AccessKey != "" && c.SecretKey != "") {
-		_, _, data, err = s.unlocked(r)
-		if err != nil {
-			fail(w, 423, err)
-			return
-		}
-	}
-	if c.ID != "" {
-		for _, existing := range data.Connections {
-			if existing.ID == c.ID {
-				if c.AccessKey == "" {
-					c.AccessKey = existing.AccessKey
-				}
-				if c.SecretKey == "" {
-					c.SecretKey = existing.SecretKey
-				}
-				break
-			}
-		}
-	}
-	if err := validateS3Connection(r.Context(), c); err != nil {
-		fail(w, http.StatusBadRequest, fmt.Errorf("connection test failed: %w", err))
-		return
-	}
-	write(w, map[string]bool{"ok": true})
-}
-
-func validateS3Connection(ctx context.Context, c vault.Connection) error {
-	client, err := s3client.New(ctx, c)
-	if err != nil {
-		return err
-	}
-	_, err = client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(c.Bucket)})
-	return err
-}
-func (s *Server) updateConnection(w http.ResponseWriter, r *http.Request) {
-	session, _, data, err := s.unlocked(r)
-	if err != nil {
-		fail(w, 423, err)
-		return
-	}
-	var update vault.Connection
-	if json.NewDecoder(r.Body).Decode(&update) != nil || update.ID == "" || update.Name == "" || update.Bucket == "" {
-		fail(w, 400, errors.New("id, name, and bucket are required"))
-		return
-	}
-	if s.isOrganizationConnection(update.ID) {
-		fail(w, http.StatusForbidden, errors.New("organization connections cannot be edited"))
-		return
-	}
-	for i := range data.Connections {
-		if data.Connections[i].ID != update.ID {
-			continue
-		}
-		if update.AccessKey == "" {
-			update.AccessKey = data.Connections[i].AccessKey
-		}
-		if update.SecretKey == "" {
-			update.SecretKey = data.Connections[i].SecretKey
-		}
-		if err := validateS3Connection(r.Context(), update); err != nil {
-			fail(w, http.StatusBadRequest, fmt.Errorf("connection test failed: %w", err))
-			return
-		}
-		data.Connections[i] = update
-		if err = s.Vault.Save(session.User.ID, session.Password, data); err != nil {
-			fail(w, 500, err)
-			return
-		}
-		write(w, map[string]bool{"ok": true})
-		s.audit(session, "connection.update", "success", map[string]string{"connection_id": update.ID, "bucket": update.Bucket})
-		return
-	}
-	fail(w, 404, errors.New("connection not found"))
-}
-func (s *Server) deleteConnection(w http.ResponseWriter, r *http.Request) {
-	session, _, data, err := s.unlocked(r)
-	if err != nil {
-		fail(w, 423, err)
-		return
-	}
-	id := r.URL.Query().Get("id")
-	if s.isOrganizationConnection(id) {
-		fail(w, http.StatusForbidden, errors.New("organization connections cannot be deleted"))
-		return
-	}
-	for i, c := range data.Connections {
-		if c.ID == id {
-			data.Connections = append(data.Connections[:i], data.Connections[i+1:]...)
-			break
-		}
-	}
-	if err = s.Vault.Save(session.User.ID, session.Password, data); err != nil {
-		fail(w, 500, err)
-		return
-	}
-	write(w, map[string]bool{"ok": true})
-	s.audit(session, "connection.delete", "success", map[string]string{"connection_id": id})
-}
 func (s *Server) isOrganizationConnection(id string) bool {
 	for _, org := range s.organizationConfig() {
 		for _, connection := range org.Connections {
@@ -622,6 +563,33 @@ func (s *Server) isOrganizationConnection(id string) bool {
 	}
 	return false
 }
+
+// IsOrganizationConnection exposes the policy callback used by the
+// connection API while keeping organization configuration owned by the HTTP
+// server during this incremental migration.
+func (s *Server) IsOrganizationConnection(id string) bool {
+	return s.isOrganizationConnection(id)
+}
+
+func (s *Server) connectionController() *connectioncontroller.ConnectionController {
+	if s.ConnectionCtrl == nil {
+		s.ConnectionCtrl = &connectioncontroller.ConnectionController{
+			API: s.Connections,
+			Unlocked: func(r *http.Request) (auth.Session, error) {
+				session, _, _, err := s.unlocked(r)
+				return session, err
+			},
+			AdminAllowed: s.adminAllowed,
+			MergeConnections: func(user auth.User, connections []model.Connection) []model.Connection {
+				merged := s.withOrganizations(user, vault.Data{Connections: connections})
+				return merged.Connections
+			},
+			Audit: s.audit,
+		}
+	}
+	return s.ConnectionCtrl
+}
+
 func (s *Server) createFolder(w http.ResponseWriter, r *http.Request) {
 	session, _, data, err := s.unlocked(r)
 	if err != nil {
@@ -634,22 +602,25 @@ func (s *Server) createFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request struct{ Name, Prefix string }
-	if json.NewDecoder(r.Body).Decode(&request) != nil || strings.TrimSpace(request.Name) == "" {
+	if DecodeJSON(w, r, &request) != nil || strings.TrimSpace(request.Name) == "" {
 		fail(w, 400, errors.New("folder name is required"))
 		return
 	}
 	name := strings.Trim(strings.TrimSpace(request.Name), "/")
 	prefix := strings.Trim(request.Prefix, "/")
+	if err := validateObjectName(prefix + "/" + name); err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
 	key := name + "/"
 	if prefix != "" {
 		key = prefix + "/" + key
 	}
-	client, err := s3client.New(r.Context(), c)
-	if err != nil {
-		fail(w, 500, err)
+	if s.Storage == nil {
+		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
 	}
-	if _, err = client.PutObject(r.Context(), &s3.PutObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(key), Body: strings.NewReader("")}); err != nil {
+	if _, err = s.Storage.CreateFolder(r.Context(), c, prefix, name); err != nil {
 		fail(w, 502, err)
 		return
 	}
@@ -709,7 +680,7 @@ func (s *Server) organizationConfig() map[string]vault.Organization {
 	for name, organization := range s.Organizations {
 		result[name] = organization
 	}
-	if dynamic, err := s.Vault.ListOrganizations(); err == nil {
+	if dynamic, err := s.organizationRepository().List(); err == nil {
 		for name, organization := range dynamic {
 			result[name] = organization
 		}
@@ -727,14 +698,6 @@ func hasGroup(userGroups, required []string) bool {
 	return false
 }
 
-type item struct {
-	Name     string     `json:"name"`
-	Key      string     `json:"key"`
-	Kind     string     `json:"kind"`
-	Size     int64      `json:"size,omitempty"`
-	Modified *time.Time `json:"modified,omitempty"`
-}
-
 func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
 	session, _, data, err := s.unlocked(r)
 	if err != nil {
@@ -746,58 +709,27 @@ func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, err)
 		return
 	}
-	client, err := s3client.New(r.Context(), c)
-	if err != nil {
-		fail(w, 500, err)
-		return
-	}
 	prefix := r.URL.Query().Get("prefix")
-	if prefix == "" {
-		prefix = c.Prefix
-	}
 	kind := r.URL.Query().Get("kind")
-	if kind == "" {
-		kind = "all"
-	}
-	if kind != "all" && kind != "file" && kind != "folder" {
-		fail(w, http.StatusBadRequest, fmt.Errorf("invalid browse kind %q", kind))
+	if s.Storage == nil {
+		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
 	}
-	input := &s3.ListObjectsV2Input{
-		Bucket:    aws.String(c.Bucket),
-		Prefix:    aws.String(prefix),
-		Delimiter: aws.String("/"),
-	}
-	if token := r.URL.Query().Get("continuationToken"); token != "" {
-		input.ContinuationToken = aws.String(token)
-	}
-	result, err := client.ListObjectsV2(r.Context(), input)
+	result, err := s.Storage.Browse(r.Context(), c, prefix, kind, r.URL.Query().Get("continuationToken"))
 	if err != nil {
-		fail(w, 502, err)
+		if strings.Contains(err.Error(), "invalid browse kind") {
+			fail(w, http.StatusBadRequest, err)
+		} else {
+			fail(w, 502, err)
+		}
 		return
 	}
-	items := make([]item, 0)
-	if kind != "file" {
-		for _, p := range result.CommonPrefixes {
-			key := aws.ToString(p.Prefix)
-			items = append(items, item{Name: strings.TrimSuffix(strings.TrimPrefix(key, prefix), "/"), Key: key, Kind: "folder"})
-		}
-	}
-	if kind != "folder" {
-		for _, object := range result.Contents {
-			key := aws.ToString(object.Key)
-			if key != prefix {
-				items = append(items, item{Name: path.Base(key), Key: key, Kind: "file", Size: aws.ToInt64(object.Size), Modified: object.LastModified})
-			}
-		}
-	}
-	sort.Slice(items, func(i, j int) bool { return items[i].Kind > items[j].Kind || items[i].Name < items[j].Name })
 	write(w, map[string]any{
-		"connection": c.Name,
-		"prefix":     prefix,
-		"items":      items,
-		"nextToken":  aws.ToString(result.NextContinuationToken),
-		"hasMore":    aws.ToBool(result.IsTruncated),
+		"connection": result.Connection,
+		"prefix":     result.Prefix,
+		"items":      result.Items,
+		"nextToken":  result.NextToken,
+		"hasMore":    result.HasMore,
 	})
 }
 
@@ -828,74 +760,26 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, fmt.Errorf("invalid search kind %q", kind))
 		return
 	}
-	client, err := s3client.New(r.Context(), c)
-	if err != nil {
-		fail(w, 500, err)
+	if s.Storage == nil {
+		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
 	}
 	prefix := r.URL.Query().Get("prefix")
-	if prefix == "" {
-		prefix = c.Prefix
+	result, err := s.Storage.Search(r.Context(), c, prefix, query, kind)
+	if err != nil {
+		if strings.Contains(err.Error(), "required") || strings.Contains(err.Error(), "invalid browse kind") {
+			fail(w, http.StatusBadRequest, err)
+		} else {
+			fail(w, 502, err)
+		}
+		return
 	}
-	needle := strings.ToLower(query)
-	input := &s3.ListObjectsV2Input{
-		Bucket:    aws.String(c.Bucket),
-		Prefix:    aws.String(prefix),
-		Delimiter: aws.String("/"),
-	}
-	items := make([]item, 0)
-	for {
-		result, listErr := client.ListObjectsV2(r.Context(), input)
-		if listErr != nil {
-			fail(w, 502, listErr)
-			return
-		}
-		if kind != "file" {
-			for _, p := range result.CommonPrefixes {
-				key := aws.ToString(p.Prefix)
-				name := strings.TrimSuffix(strings.TrimPrefix(key, prefix), "/")
-				if strings.Contains(strings.ToLower(name), needle) {
-					items = append(items, item{Name: name, Key: key, Kind: "folder"})
-				}
-			}
-		}
-		if kind != "folder" {
-			for _, object := range result.Contents {
-				key := aws.ToString(object.Key)
-				name := path.Base(key)
-				if key != prefix && strings.Contains(strings.ToLower(name), needle) {
-					items = append(items, item{Name: name, Key: key, Kind: "file", Size: aws.ToInt64(object.Size), Modified: object.LastModified})
-				}
-			}
-		}
-		if !aws.ToBool(result.IsTruncated) {
-			break
-		}
-		input.ContinuationToken = result.NextContinuationToken
-	}
-	sort.Slice(items, func(i, j int) bool { return items[i].Kind > items[j].Kind || items[i].Name < items[j].Name })
 	write(w, map[string]any{
-		"connection": c.Name,
-		"prefix":     prefix,
-		"items":      items,
+		"connection": result.Connection,
+		"prefix":     result.Prefix,
+		"items":      result.Items,
 		"hasMore":    false,
 	})
-}
-
-type multipartUploadInfo struct {
-	UploadID  string    `json:"uploadId"`
-	Key       string    `json:"key"`
-	Initiated time.Time `json:"initiated"`
-}
-
-type objectVersionInfo struct {
-	VersionID    string    `json:"versionId"`
-	Key          string    `json:"key"`
-	IsLatest     bool      `json:"isLatest"`
-	LastModified time.Time `json:"lastModified"`
-	Size         int64     `json:"size"`
-	ETag         string    `json:"etag,omitempty"`
-	DeleteMarker bool      `json:"deleteMarker"`
 }
 
 func (s *Server) versions(w http.ResponseWriter, r *http.Request) {
@@ -914,51 +798,15 @@ func (s *Server) versions(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, err)
 		return
 	}
-	client, err := s3client.New(r.Context(), c)
-	if err != nil {
-		fail(w, http.StatusInternalServerError, err)
+	if s.Storage == nil {
+		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
 	}
-	input := &s3.ListObjectVersionsInput{Bucket: aws.String(c.Bucket), Prefix: aws.String(key)}
-	versions := make([]objectVersionInfo, 0)
-	for {
-		result, listErr := client.ListObjectVersions(r.Context(), input)
-		if listErr != nil {
-			fail(w, http.StatusBadGateway, listErr)
-			return
-		}
-		for _, version := range result.Versions {
-			if aws.ToString(version.Key) != key || version.VersionId == nil || version.LastModified == nil {
-				continue
-			}
-			versions = append(versions, objectVersionInfo{
-				VersionID:    aws.ToString(version.VersionId),
-				Key:          key,
-				IsLatest:     aws.ToBool(version.IsLatest),
-				LastModified: aws.ToTime(version.LastModified),
-				Size:         aws.ToInt64(version.Size),
-				ETag:         strings.Trim(aws.ToString(version.ETag), "\""),
-			})
-		}
-		for _, marker := range result.DeleteMarkers {
-			if aws.ToString(marker.Key) != key || marker.VersionId == nil || marker.LastModified == nil {
-				continue
-			}
-			versions = append(versions, objectVersionInfo{
-				VersionID:    aws.ToString(marker.VersionId),
-				Key:          key,
-				IsLatest:     aws.ToBool(marker.IsLatest),
-				LastModified: aws.ToTime(marker.LastModified),
-				DeleteMarker: true,
-			})
-		}
-		if !aws.ToBool(result.IsTruncated) {
-			break
-		}
-		input.KeyMarker = result.NextKeyMarker
-		input.VersionIdMarker = result.NextVersionIdMarker
+	versions, err := s.Storage.Versions(r.Context(), c, key)
+	if err != nil {
+		fail(w, http.StatusBadGateway, err)
+		return
 	}
-	sort.Slice(versions, func(i, j int) bool { return versions[i].LastModified.After(versions[j].LastModified) })
 	write(w, map[string]any{"versions": versions})
 }
 
@@ -979,17 +827,11 @@ func (s *Server) deleteVersion(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, err)
 		return
 	}
-	client, err := s3client.New(r.Context(), c)
-	if err != nil {
-		fail(w, http.StatusInternalServerError, err)
+	if s.Storage == nil {
+		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
 	}
-	_, err = client.DeleteObject(r.Context(), &s3.DeleteObjectInput{
-		Bucket:    aws.String(c.Bucket),
-		Key:       aws.String(key),
-		VersionId: aws.String(versionID),
-	})
-	if err != nil {
+	if err = s.Storage.DeleteVersion(r.Context(), c, key, versionID); err != nil {
 		fail(w, http.StatusBadGateway, err)
 		return
 	}
@@ -1008,41 +850,15 @@ func (s *Server) multipartUploads(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, err)
 		return
 	}
-	client, err := s3client.New(r.Context(), c)
-	if err != nil {
-		fail(w, http.StatusInternalServerError, err)
+	if s.Storage == nil {
+		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
 	}
-	input := &s3.ListMultipartUploadsInput{Bucket: aws.String(c.Bucket)}
-	if prefix := r.URL.Query().Get("prefix"); prefix != "" {
-		input.Prefix = aws.String(prefix)
-	} else if c.Prefix != "" {
-		input.Prefix = aws.String(c.Prefix)
+	uploads, err := s.Storage.MultipartUploads(r.Context(), c, r.URL.Query().Get("prefix"))
+	if err != nil {
+		fail(w, http.StatusBadGateway, err)
+		return
 	}
-	uploads := make([]multipartUploadInfo, 0)
-	for {
-		result, listErr := client.ListMultipartUploads(r.Context(), input)
-		if listErr != nil {
-			fail(w, http.StatusBadGateway, listErr)
-			return
-		}
-		for _, upload := range result.Uploads {
-			if upload.UploadId == nil || upload.Key == nil || upload.Initiated == nil {
-				continue
-			}
-			uploads = append(uploads, multipartUploadInfo{
-				UploadID:  aws.ToString(upload.UploadId),
-				Key:       aws.ToString(upload.Key),
-				Initiated: aws.ToTime(upload.Initiated),
-			})
-		}
-		if !aws.ToBool(result.IsTruncated) {
-			break
-		}
-		input.KeyMarker = result.NextKeyMarker
-		input.UploadIdMarker = result.NextUploadIdMarker
-	}
-	sort.Slice(uploads, func(i, j int) bool { return uploads[i].Initiated.Before(uploads[j].Initiated) })
 	write(w, map[string]any{"uploads": uploads})
 }
 
@@ -1062,17 +878,11 @@ func (s *Server) multipartAbort(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, err)
 		return
 	}
-	client, err := s3client.New(r.Context(), c)
-	if err != nil {
-		fail(w, http.StatusInternalServerError, err)
+	if s.Storage == nil {
+		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
 	}
-	_, err = client.AbortMultipartUpload(r.Context(), &s3.AbortMultipartUploadInput{
-		Bucket:   aws.String(c.Bucket),
-		UploadId: aws.String(uploadID),
-		Key:      aws.String(r.URL.Query().Get("key")),
-	})
-	if err != nil {
+	if err = s.Storage.AbortMultipart(r.Context(), c, uploadID, r.URL.Query().Get("key")); err != nil {
 		fail(w, http.StatusBadGateway, err)
 		return
 	}
@@ -1091,26 +901,22 @@ func (s *Server) file(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, err)
 		return
 	}
-	client, err := s3client.New(r.Context(), c)
-	if err != nil {
-		fail(w, 500, err)
+	if s.Storage == nil {
+		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
 	}
 	key := r.URL.Query().Get("key")
-	input := &s3.GetObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(key)}
-	if versionID := r.URL.Query().Get("versionId"); versionID != "" {
-		input.VersionId = aws.String(versionID)
-	}
-	object, err := client.GetObject(r.Context(), input)
+	object, err := s.Storage.OpenObject(r.Context(), c, key, r.URL.Query().Get("versionId"))
 	if err != nil {
 		fail(w, 502, err)
 		return
 	}
 	defer object.Body.Close()
-	if object.ContentType != nil {
-		w.Header().Set("Content-Type", aws.ToString(object.ContentType))
+	if object.ContentType != "" {
+		w.Header().Set("Content-Type", object.ContentType)
 	}
-	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(key)))
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", safeDownloadName(path.Base(key))))
 	_, _ = io.Copy(w, object.Body)
 }
 func (s *Server) deleteFile(w http.ResponseWriter, r *http.Request) {
@@ -1124,93 +930,12 @@ func (s *Server) deleteFile(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, err)
 		return
 	}
-	client, err := s3client.New(r.Context(), c)
-	if err != nil {
-		fail(w, 500, err)
+	if s.Storage == nil {
+		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
 	}
 	key := r.URL.Query().Get("key")
-	digest := ""
-	if strings.HasSuffix(key, "/") {
-		versionInput := &s3.ListObjectVersionsInput{Bucket: aws.String(c.Bucket), Prefix: aws.String(key)}
-		versionObjects := make([]types.ObjectIdentifier, 0)
-		for {
-			versions, listErr := client.ListObjectVersions(r.Context(), versionInput)
-			if listErr != nil {
-				fail(w, 502, listErr)
-				return
-			}
-			for _, version := range versions.Versions {
-				if version.Key != nil && version.VersionId != nil {
-					versionObjects = append(versionObjects, types.ObjectIdentifier{Key: version.Key, VersionId: version.VersionId})
-				}
-			}
-			for _, marker := range versions.DeleteMarkers {
-				if marker.Key != nil && marker.VersionId != nil {
-					versionObjects = append(versionObjects, types.ObjectIdentifier{Key: marker.Key, VersionId: marker.VersionId})
-				}
-			}
-			if !aws.ToBool(versions.IsTruncated) {
-				break
-			}
-			versionInput.KeyMarker = versions.NextKeyMarker
-			versionInput.VersionIdMarker = versions.NextVersionIdMarker
-		}
-		for start := 0; start < len(versionObjects); start += 1000 {
-			end := start + 1000
-			if end > len(versionObjects) {
-				end = len(versionObjects)
-			}
-			result, deleteErr := client.DeleteObjects(r.Context(), &s3.DeleteObjectsInput{
-				Bucket: aws.String(c.Bucket),
-				Delete: &types.Delete{Objects: versionObjects[start:end], Quiet: aws.Bool(true)},
-			})
-			if deleteErr != nil {
-				fail(w, 502, deleteErr)
-				return
-			}
-			if len(result.Errors) > 0 {
-				fail(w, 502, fmt.Errorf("S3 rejected %d object version deletions", len(result.Errors)))
-				return
-			}
-		}
-		if len(versionObjects) == 0 {
-			var token *string
-			for {
-				list, listErr := client.ListObjectsV2(r.Context(), &s3.ListObjectsV2Input{Bucket: aws.String(c.Bucket), Prefix: aws.String(key), ContinuationToken: token})
-				if listErr != nil {
-					fail(w, 502, listErr)
-					return
-				}
-				objects := make([]types.ObjectIdentifier, 0, len(list.Contents))
-				for _, object := range list.Contents {
-					objects = append(objects, types.ObjectIdentifier{Key: object.Key})
-				}
-				if len(objects) > 0 {
-					result, deleteErr := client.DeleteObjects(r.Context(), &s3.DeleteObjectsInput{Bucket: aws.String(c.Bucket), Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)}})
-					if deleteErr != nil {
-						fail(w, 502, deleteErr)
-						return
-					}
-					if len(result.Errors) > 0 {
-						fail(w, 502, fmt.Errorf("S3 rejected %d object deletions", len(result.Errors)))
-						return
-					}
-				}
-				if !aws.ToBool(list.IsTruncated) {
-					break
-				}
-				token = list.NextContinuationToken
-			}
-		}
-	} else {
-		digest, err = objectDigest(r.Context(), client, c.Bucket, key)
-		if err != nil {
-			fail(w, 502, err)
-			return
-		}
-		_, err = client.DeleteObject(r.Context(), &s3.DeleteObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(key)})
-	}
+	digest, err := s.Storage.DeleteFile(r.Context(), c, key)
 	if err != nil {
 		fail(w, 502, err)
 		return
@@ -1219,6 +944,7 @@ func (s *Server) deleteFile(w http.ResponseWriter, r *http.Request) {
 	s.audit(session, "object.delete", "success", map[string]string{"connection_id": c.ID, "bucket": c.Bucket, "object_key": key, "file_sha256": digest})
 }
 func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 5*1024*1024*1024+32<<20)
 	session, _, data, err := s.unlocked(r)
 	if err != nil {
 		fail(w, 423, err)
@@ -1239,13 +965,16 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	client, err := s3client.New(r.Context(), c)
-	if err != nil {
-		fail(w, 500, err)
+	if s.Storage == nil {
+		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
 	}
 	hasher := sha256.New()
 	key := r.URL.Query().Get("prefix") + header.Filename
+	if err := validateObjectName(key); err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
 	if _, err = io.Copy(hasher, file); err != nil {
 		s.audit(session, "object.upload", "error", map[string]string{"connection_id": c.ID, "bucket": c.Bucket, "object_key": key, "file_sha256": hex.EncodeToString(hasher.Sum(nil)), "error": err.Error()})
 		fail(w, 502, err)
@@ -1260,11 +989,7 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		fail(w, 413, errors.New("file exceeds the S3 single-upload limit"))
 		return
 	}
-	if header.Size > 100*1024*1024 {
-		err = multipartUpload(r.Context(), client, c.Bucket, key, file, header.Size, header.Header.Get("Content-Type"))
-	} else {
-		_, err = client.PutObject(r.Context(), &s3.PutObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(key), Body: file, ContentLength: aws.Int64(header.Size), ContentType: aws.String(header.Header.Get("Content-Type")), ChecksumSHA256: aws.String(checksum)})
-	}
+	err = s.Storage.Upload(r.Context(), c, key, file, header.Size, header.Header.Get("Content-Type"), checksum)
 	if err != nil {
 		s.audit(session, "object.upload", "error", map[string]string{"connection_id": c.ID, "bucket": c.Bucket, "object_key": key, "file_sha256": hex.EncodeToString(hasher.Sum(nil)), "error": err.Error()})
 		fail(w, 502, err)
@@ -1287,8 +1012,12 @@ func (s *Server) uploadInit(w http.ResponseWriter, r *http.Request) {
 		Size        int64  `json:"size"`
 		ContentType string `json:"contentType"`
 	}
-	if err = json.NewDecoder(r.Body).Decode(&request); err != nil || strings.TrimSpace(request.Name) == "" || request.Size < 0 {
+	if err = DecodeJSON(w, r, &request); err != nil || strings.TrimSpace(request.Name) == "" || request.Size < 0 {
 		fail(w, http.StatusBadRequest, errors.New("file name and size are required"))
+		return
+	}
+	if err := validateObjectName(request.Prefix + request.Name); err != nil {
+		fail(w, http.StatusBadRequest, err)
 		return
 	}
 	c, err := s.connectionValue(request.Connection, data, session.User)
@@ -1296,39 +1025,48 @@ func (s *Server) uploadInit(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, err)
 		return
 	}
-	client, err := s3client.New(r.Context(), c)
-	if err != nil {
-		fail(w, http.StatusInternalServerError, err)
+	if s.Storage == nil {
+		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
 	}
 	key := request.Prefix + request.Name
-	created, err := client.CreateMultipartUpload(r.Context(), &s3.CreateMultipartUploadInput{Bucket: aws.String(c.Bucket), Key: aws.String(key), ContentType: aws.String(request.ContentType)})
+	uploadID, err := s.Storage.InitMultipart(r.Context(), c, key, request.ContentType)
 	if err != nil {
 		fail(w, http.StatusBadGateway, err)
-		return
-	}
-	if aws.ToString(created.UploadId) == "" {
-		fail(w, http.StatusBadGateway, errors.New("S3 returned an empty multipart upload ID"))
 		return
 	}
 	s.uploadMu.Lock()
 	if s.uploads == nil {
 		s.uploads = make(map[string]*uploadState)
 	}
-	s.uploads[aws.ToString(created.UploadId)] = &uploadState{UserID: session.User.ID, Connection: c, Bucket: c.Bucket, Key: key, UploadID: aws.ToString(created.UploadId), Hash: sha256.New(), NextPart: 1}
+	tempDir, tempErr := os.MkdirTemp("", "mariner-upload-")
+	if tempErr != nil {
+		s.uploadMu.Unlock()
+		_ = s.Storage.AbortMultipart(r.Context(), c, uploadID, key)
+		fail(w, http.StatusInternalServerError, tempErr)
+		return
+	}
+	s.uploads[uploadID] = &uploadState{UserID: session.User.ID, Connection: c, Bucket: c.Bucket, Key: key, UploadID: uploadID, Parts: make(map[int32]model.UploadPart), PartPaths: make(map[int32]string), TempDir: tempDir}
 	s.uploadMu.Unlock()
-	write(w, map[string]string{"uploadId": aws.ToString(created.UploadId), "key": key})
+	slog.Info("multipart upload initialized", "upload_id", uploadID, "part_size", s.uploadPartSize(), "concurrency", s.uploadPartConcurrency(), "size", request.Size)
+	write(w, map[string]any{"uploadId": uploadID, "key": key, "partSize": s.uploadPartSize(), "concurrency": s.uploadPartConcurrency()})
 }
 
 func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
-	session, _, data, err := s.unlocked(r)
+	started := time.Now()
+	uploadID := r.URL.Query().Get("uploadId")
+	partNumber, parseErr := strconv.ParseInt(r.URL.Query().Get("partNumber"), 10, 32)
+	partFields := func() []any {
+		return []any{"upload_id", uploadID, "part_number", partNumber}
+	}
+	stageStarted := time.Now()
+	session, _, err := s.session(r)
 	if err != nil {
-		fail(w, 423, err)
+		fail(w, http.StatusUnauthorized, err)
 		return
 	}
-	uploadID := r.URL.Query().Get("uploadId")
-	partNumber, err := strconv.ParseInt(r.URL.Query().Get("partNumber"), 10, 32)
-	if uploadID == "" || err != nil || partNumber < 1 {
+	slog.Info("multipart part stage", append(partFields(), "stage", "session", "duration_ms", time.Since(stageStarted).Milliseconds())...)
+	if uploadID == "" || parseErr != nil || partNumber < 1 {
 		fail(w, http.StatusBadRequest, errors.New("upload ID and part number are required"))
 		return
 	}
@@ -1339,40 +1077,49 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, errors.New("multipart upload not found"))
 		return
 	}
-	if int32(partNumber) != state.NextPart {
-		fail(w, http.StatusBadRequest, errors.New("multipart parts must be uploaded in order"))
-		return
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, multipartPartSize+1))
+	partSize := s.uploadPartSize()
+	r.Body = http.MaxBytesReader(w, r.Body, partSize+1)
+	stageStarted = time.Now()
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		fail(w, http.StatusBadRequest, err)
 		return
 	}
-	if int64(len(body)) > multipartPartSize {
+	if int64(len(body)) > partSize {
 		fail(w, http.StatusRequestEntityTooLarge, errors.New("upload part is too large"))
 		return
 	}
-	c, err := s.connectionValue(r.URL.Query().Get("connection"), data, session.User)
-	if err != nil {
-		fail(w, http.StatusNotFound, err)
+	slog.Info("multipart part stage", append(partFields(), "stage", "read_request_body", "duration_ms", time.Since(stageStarted).Milliseconds(), "bytes", len(body), "content_length", r.ContentLength)...)
+	if s.Storage == nil {
+		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
 	}
-	client, err := s3client.New(r.Context(), c)
-	if err != nil {
-		fail(w, http.StatusInternalServerError, err)
-		return
-	}
-	part, err := client.UploadPart(r.Context(), &s3.UploadPartInput{Bucket: aws.String(state.Bucket), Key: aws.String(state.Key), UploadId: aws.String(uploadID), PartNumber: aws.Int32(int32(partNumber)), Body: bytes.NewReader(body), ContentLength: aws.Int64(int64(len(body)))})
+	stageStarted = time.Now()
+	etag, err := s.Storage.UploadPart(r.Context(), state.Connection, uploadID, state.Key, int32(partNumber), body)
 	if err != nil {
 		fail(w, http.StatusBadGateway, err)
 		return
 	}
+	slog.Info("multipart part stage", append(partFields(), "stage", "s3_upload_part", "duration_ms", time.Since(stageStarted).Milliseconds(), "bytes", len(body))...)
+	partPath := filepath.Join(state.TempDir, fmt.Sprintf("%08d.part", partNumber))
+	stageStarted = time.Now()
+	if err := os.WriteFile(partPath, body, 0600); err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	slog.Info("multipart part stage", append(partFields(), "stage", "write_temp_part", "duration_ms", time.Since(stageStarted).Milliseconds(), "bytes", len(body))...)
+	stageStarted = time.Now()
 	s.uploadMu.Lock()
-	state.Hash.Write(body)
-	state.Parts = append(state.Parts, types.CompletedPart{ETag: part.ETag, PartNumber: aws.Int32(int32(partNumber))})
-	state.NextPart++
+	if _, exists := state.Parts[int32(partNumber)]; exists {
+		s.uploadMu.Unlock()
+		fail(w, http.StatusConflict, errors.New("multipart part was already uploaded"))
+		return
+	}
+	state.Parts[int32(partNumber)] = model.UploadPart{ETag: etag, PartNumber: int32(partNumber)}
+	state.PartPaths[int32(partNumber)] = partPath
 	s.uploadMu.Unlock()
-	write(w, map[string]any{"partNumber": partNumber, "etag": aws.ToString(part.ETag)})
+	slog.Info("multipart part completed", append(partFields(), "duration_ms", time.Since(started).Milliseconds(), "bytes", len(body))...)
+	write(w, map[string]any{"partNumber": partNumber, "etag": etag})
 }
 
 func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
@@ -1401,20 +1148,60 @@ func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, err)
 		return
 	}
-	client, err := s3client.New(r.Context(), c)
-	if err != nil {
-		fail(w, http.StatusInternalServerError, err)
+	if s.Storage == nil {
+		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
 	}
-	_, err = client.CompleteMultipartUpload(r.Context(), &s3.CompleteMultipartUploadInput{Bucket: aws.String(state.Bucket), Key: aws.String(state.Key), UploadId: aws.String(uploadID), MultipartUpload: &types.CompletedMultipartUpload{Parts: state.Parts}})
+	parts, err := orderedUploadParts(state.Parts)
 	if err != nil {
-		_, _ = client.AbortMultipartUpload(r.Context(), &s3.AbortMultipartUploadInput{Bucket: aws.String(state.Bucket), Key: aws.String(state.Key), UploadId: aws.String(uploadID)})
+		os.RemoveAll(state.TempDir)
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	hasher := sha256.New()
+	for _, part := range parts {
+		file, openErr := os.Open(state.PartPaths[part.PartNumber])
+		if openErr != nil {
+			os.RemoveAll(state.TempDir)
+			fail(w, http.StatusInternalServerError, openErr)
+			return
+		}
+		_, copyErr := io.Copy(hasher, file)
+		closeErr := file.Close()
+		if copyErr != nil || closeErr != nil {
+			os.RemoveAll(state.TempDir)
+			if copyErr != nil {
+				fail(w, http.StatusInternalServerError, copyErr)
+			} else {
+				fail(w, http.StatusInternalServerError, closeErr)
+			}
+			return
+		}
+	}
+	err = s.Storage.CompleteMultipart(r.Context(), c, uploadID, state.Key, parts)
+	os.RemoveAll(state.TempDir)
+	if err != nil {
 		fail(w, http.StatusBadGateway, err)
 		return
 	}
-	digest := hex.EncodeToString(state.Hash.Sum(nil))
+	digest := hex.EncodeToString(hasher.Sum(nil))
 	s.audit(session, "object.upload", "success", map[string]string{"connection_id": c.ID, "bucket": c.Bucket, "object_key": state.Key, "file_sha256": digest})
 	write(w, map[string]bool{"ok": true})
+}
+
+func orderedUploadParts(uploaded map[int32]model.UploadPart) ([]model.UploadPart, error) {
+	if len(uploaded) == 0 {
+		return nil, errors.New("multipart parts are incomplete")
+	}
+	parts := make([]model.UploadPart, 0, len(uploaded))
+	for partNumber := int32(1); partNumber <= int32(len(uploaded)); partNumber++ {
+		part, exists := uploaded[partNumber]
+		if !exists {
+			return nil, errors.New("multipart parts are incomplete")
+		}
+		parts = append(parts, part)
+	}
+	return parts, nil
 }
 
 func (s *Server) uploadAbort(w http.ResponseWriter, r *http.Request) {
@@ -1434,60 +1221,27 @@ func (s *Server) uploadAbort(w http.ResponseWriter, r *http.Request) {
 		write(w, map[string]bool{"ok": true})
 		return
 	}
-	client, err := s3client.New(r.Context(), state.Connection)
-	if err == nil {
-		_, _ = client.AbortMultipartUpload(r.Context(), &s3.AbortMultipartUploadInput{Bucket: aws.String(state.Bucket), Key: aws.String(state.Key), UploadId: aws.String(uploadID)})
+	if s.Storage != nil {
+		_ = s.Storage.AbortMultipart(r.Context(), state.Connection, uploadID, state.Key)
 	}
+	os.RemoveAll(state.TempDir)
 	write(w, map[string]bool{"ok": true})
 }
 
-const multipartPartSize int64 = 64 * 1024 * 1024
-
-func multipartUpload(ctx context.Context, client *s3.Client, bucket, key string, file io.ReaderAt, size int64, contentType string) error {
-	created, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String(bucket), Key: aws.String(key), ContentType: aws.String(contentType)})
-	if err != nil {
-		return err
+func (s *Server) uploadPartSize() int64 {
+	if s.UploadPartSize > 0 {
+		return s.UploadPartSize
 	}
-	uploadID := aws.ToString(created.UploadId)
-	abort := true
-	defer func() {
-		if abort {
-			_, _ = client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: aws.String(bucket), Key: aws.String(key), UploadId: aws.String(uploadID)})
-		}
-	}()
-	parts := make([]types.CompletedPart, 0, (size+multipartPartSize-1)/multipartPartSize)
-	for partNumber, offset := int32(1), int64(0); offset < size; partNumber, offset = partNumber+1, offset+multipartPartSize {
-		partSize := multipartPartSize
-		if remaining := size - offset; remaining < partSize {
-			partSize = remaining
-		}
-		part, err := client.UploadPart(ctx, &s3.UploadPartInput{Bucket: aws.String(bucket), Key: aws.String(key), UploadId: aws.String(uploadID), PartNumber: aws.Int32(partNumber), Body: io.NewSectionReader(file, offset, partSize), ContentLength: aws.Int64(partSize)})
-		if err != nil {
-			return err
-		}
-		parts = append(parts, types.CompletedPart{ETag: part.ETag, PartNumber: aws.Int32(partNumber)})
-	}
-	_, err = client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: aws.String(bucket), Key: aws.String(key), UploadId: aws.String(uploadID), MultipartUpload: &types.CompletedMultipartUpload{Parts: parts}})
-	if err == nil {
-		abort = false
-	}
-	return err
+	return s3service.MultipartPartSize
 }
 
-func objectDigest(ctx context.Context, client *s3.Client, bucket, key string) (string, error) {
-	object, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(key), ChecksumMode: types.ChecksumModeEnabled})
-	if err != nil {
-		return "", err
+func (s *Server) uploadPartConcurrency() int {
+	if s.UploadPartConcurrency > 0 {
+		return s.UploadPartConcurrency
 	}
-	if object.ChecksumSHA256 == nil || aws.ToString(object.ChecksumSHA256) == "" {
-		return "", nil
-	}
-	digest, err := base64.StdEncoding.DecodeString(aws.ToString(object.ChecksumSHA256))
-	if err != nil {
-		return "", nil
-	}
-	return hex.EncodeToString(digest), nil
+	return 1
 }
+
 func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 	session, _, data, err := s.unlocked(r)
 	if err != nil {
@@ -1504,9 +1258,13 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, errors.New("format must be zip or tgz"))
 		return
 	}
-	client, err := s3client.New(r.Context(), c)
+	if s.Storage == nil {
+		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
+		return
+	}
+	settings, err := s.applicationSettingsRepository().Get()
 	if err != nil {
-		fail(w, 500, err)
+		fail(w, http.StatusInternalServerError, err)
 		return
 	}
 	name := strings.Trim(strings.TrimSuffix(prefix, "/"), "/")
@@ -1518,73 +1276,49 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		ext = ".tar.gz"
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name+ext))
-	var zw *zip.Writer
-	var tw *tar.Writer
-	var gz *gzip.Writer
-	if format == "zip" {
-		zw = zip.NewWriter(w)
-		defer zw.Close()
-	} else {
-		gz = gzip.NewWriter(w)
-		defer gz.Close()
-		tw = tar.NewWriter(gz)
-		defer tw.Close()
-	}
-	p := &s3.ListObjectsV2Input{Bucket: aws.String(c.Bucket), Prefix: aws.String(prefix)}
-	for {
-		out, e := client.ListObjectsV2(r.Context(), p)
-		if e != nil {
-			return
-		}
-		for _, obj := range out.Contents {
-			key := aws.ToString(obj.Key)
-			rel := strings.TrimPrefix(key, prefix)
-			if rel == "" {
-				continue
-			}
-			body, e := client.GetObject(r.Context(), &s3.GetObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(key)})
-			if e != nil {
-				return
-			}
-			if format == "zip" {
-				entry, e := zw.Create(rel)
-				if e == nil {
-					_, e = io.Copy(entry, body.Body)
-				}
-				body.Body.Close()
-				if e != nil {
-					return
-				}
-			} else {
-				header := &tar.Header{Name: rel, Mode: 0600, Size: aws.ToInt64(obj.Size), ModTime: aws.ToTime(obj.LastModified)}
-				if e = tw.WriteHeader(header); e == nil {
-					_, e = io.Copy(tw, body.Body)
-				}
-				body.Body.Close()
-				if e != nil {
-					return
-				}
-			}
-		}
-		if !aws.ToBool(out.IsTruncated) {
-			break
-		}
-		p.ContinuationToken = out.NextContinuationToken
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", safeDownloadName(name+ext)))
+	if err = s.Storage.DownloadArchive(r.Context(), c, prefix, format, settings.ArchiveMaxBytes, w); err != nil {
+		return
 	}
 	s.audit(session, "object.download", "success", map[string]string{"connection_id": c.ID, "bucket": c.Bucket, "object_key": prefix})
 }
 func publicConnections(data vault.Data) []vault.Connection {
 	result := make([]vault.Connection, 0, len(data.Connections))
 	for _, c := range data.Connections {
-		c.AccessKey, c.SecretKey = "", ""
-		result = append(result, c)
+		result = append(result, publicConnection(c))
 	}
 	return result
+}
+func publicConnection(connection vault.Connection) vault.Connection {
+	response := mapper.ConnectionToResponse(connection)
+	return vault.Connection{
+		ID: response.ID, Name: response.Name, Bucket: response.Bucket,
+		Region: response.Region, Endpoint: response.Endpoint, Prefix: response.Prefix,
+	}
+}
+func safeDownloadName(name string) string {
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, name)
+	if name == "" {
+		return "download"
+	}
+	return name
 }
 func randomID() string { return fmt.Sprintf("%d", time.Now().UnixNano()) }
 func write(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(value)
 }
-func fail(w http.ResponseWriter, status int, err error) { http.Error(w, err.Error(), status) }
+func fail(w http.ResponseWriter, status int, err error) {
+	if status >= http.StatusInternalServerError {
+		slog.Error("request failed", "status", status, "error", err)
+		err = errors.New("request could not be completed")
+	}
+	http.Error(w, err.Error(), status)
+}

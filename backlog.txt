@@ -1,0 +1,649 @@
+Mariner backend rearchitecture backlog
+========================================
+
+Purpose
+-------
+
+Reorganize the Go backend for human maintainers without changing the external
+product behavior unnecessarily. The target architecture must make the
+following boundaries obvious:
+
+* Models represent business concepts and are not HTTP or SQL implementation
+  details.
+* HTTP controllers own routing, decoding, authentication context extraction,
+  status-code mapping, and DTO serialization.
+* The API/application layer owns business rules and use cases.
+* Services own dedicated capabilities and external systems such as S3, OIDC,
+  encryption, audit logging, and future email delivery.
+* Each core database table has its own repository.
+* `cmd/mariner` is the composition root and wires concrete implementations.
+
+This is an incremental refactor. Preserve API routes, JSON contracts, vault
+encryption behavior, audit event JSON, authorization behavior, and S3 behavior
+unless a task explicitly changes the contract.
+
+Current-state findings
+----------------------
+
+The current backend is a modular monolith with useful package boundaries, but
+the HTTP package is doing too much:
+
+* `internal/httpapi/server.go` is approximately 1,590 lines.
+* It defines routes and all HTTP handlers in one file.
+* Handlers decode request JSON, validate input, enforce auth/unlock/admin
+  rules, select organization connections, call the database, construct S3
+  clients, perform S3 operations, write audit events, and serialize responses.
+* `internal/vault/store.go` combines SQL schema migration, SQL queries,
+  encrypted vault storage, organization storage, preferences, and audit-event
+  storage.
+* `vault.Connection`, `vault.Organization`, and `vault.Data` are simultaneously
+  domain structures, persistence payloads, and API JSON structures.
+* Many request and response DTOs are anonymous structs or `map[string]any`
+  values local to handlers.
+* `internal/s3/client.go` is a client factory, while S3 operation workflows are
+  embedded in HTTP handlers.
+* Sessions and multipart-upload state are in-memory concerns and should remain
+  services unless a future persistence requirement is introduced.
+
+Target package shape
+--------------------
+
+Use names that communicate responsibility. Exact folders may evolve, but new
+code should converge on this dependency direction:
+
+    cmd/mariner
+        -> composition / wiring only
+
+    internal/httpapi/controller
+        -> internal/api
+        -> internal/model
+        -> transport DTOs
+
+    internal/api
+        -> internal/model
+        -> repository interfaces
+        -> service interfaces
+
+    internal/service
+        -> internal/model
+        -> external SDKs and technical concerns
+
+    internal/repository
+        -> internal/model or persistence records
+        -> database/sql and sqlx
+
+    internal/httpapi/dto
+        -> transport-only request and response types
+
+Recommended layout:
+
+    cmd/mariner/main.go
+    internal/model/
+      user.go
+      session.go
+      vault.go
+      connection.go
+      organization.go
+      preferences.go
+      audit.go
+      object.go
+      upload.go
+    internal/api/
+      auth.go
+      vault.go
+      connections.go
+      objects.go
+      uploads.go
+      organizations.go
+      audit.go
+      preferences.go
+      errors.go
+    internal/httpapi/
+      router.go
+      middleware.go
+      response.go
+      dto/
+        auth.go
+        vault.go
+        connections.go
+        objects.go
+        uploads.go
+        organizations.go
+        audit.go
+      controller/
+        auth.go
+        vault.go
+        connections.go
+        objects.go
+        uploads.go
+        organizations.go
+        audit.go
+        preferences.go
+    internal/repository/
+      interfaces.go
+      sql/
+        db.go
+        migrations.go
+        vault_repository.go
+        audit_event_repository.go
+        organization_repository.go
+        user_preference_repository.go
+    internal/service/
+      auth/
+      session/
+      vault/
+      s3/
+      audit/
+      organization/
+      upload/
+      logging/
+      email/                 # only when email is introduced
+    internal/config/
+
+Do not create a generic `utils`, `helpers`, or `manager` package. Keep
+interfaces close to the API consumer, and keep implementations in repository
+or service packages.
+
+Mapping decision
+----------------
+
+Do not introduce a reflection-based AutoMapper-style library. Use explicit,
+handwritten mapping functions at each architectural boundary.
+
+Use constructors for creating valid domain objects and enforcing domain
+invariants. Use mappers for translating between boundaries:
+
+    HTTP request DTO -> API command/input -> domain model
+    database row      -> persistence record -> domain model
+    domain model      -> API result       -> HTTP response DTO
+
+Mapping functions should live with the boundary that owns the translation. Do
+not add methods such as `model.Connection.ToUI()` because that would make the
+domain package depend on transport types. Do not serialize domain models
+directly when a response projection can contain secrets or persistence-only
+fields.
+
+For example, a connection response mapper must intentionally omit access and
+secret keys. A constructor such as `model.NewConnection` should validate the
+minimum business invariants, while `dto.CreateConnectionRequest` mapping
+should handle HTTP field names and request shape.
+
+Reasons for this decision:
+
+* Mapping counts are small enough to keep explicit and reviewable.
+* Credential redaction must be visible in code and difficult to bypass.
+* UI/API DTOs will intentionally differ from backend and persistence models.
+* Reflection-based mapping can silently copy new sensitive fields.
+* Normalization, defaults, and projections are business decisions rather than
+  mechanical field copies.
+
+If the number of repetitive mappings grows substantially, generated mapping
+code may be evaluated later, but a runtime reflection mapper is not part of
+the target architecture.
+
+Architecture rules and acceptance criteria
+--------------------------------------------
+
+The rearchitecture is complete only when all of these are true:
+
+* Controllers do not execute SQL, construct AWS SDK clients, encrypt data, or
+  contain multi-step business workflows.
+* API/application code does not import `net/http`, `chi`, AWS SDK packages,
+  `database/sql`, `sqlx`, or JSON transport DTO packages.
+* Services hide external clients and technical concerns behind small
+  interfaces.
+* Each core table has exactly one primary repository abstraction and one
+  concrete SQL implementation.
+* Models do not expose database-only columns or transport-only fields unless
+  the field is genuinely part of the domain model.
+* API DTOs are explicit, versionable, and mapped to/from models at the HTTP
+  boundary.
+* SQL is centralized in repositories; migrations are centralized in the DB
+  package.
+* Error categories are stable and controllers map them to HTTP status codes in
+  one place.
+* Unit tests can exercise business rules with fake repositories and fake
+  services without starting a database, OIDC provider, or S3 server.
+* HTTP tests can exercise controllers with fake API use cases without AWS or
+  database dependencies.
+* Integration tests cover each SQL repository against SQLite and PostgreSQL as
+  applicable, plus S3 behavior against MinIO.
+* No credential, master password, session secret, JWT, cookie, or object
+  contents are logged or included in audit events.
+
+Backlog
+-------
+
+Priority: P0 = architecture foundation or behavior risk; P1 = required for
+the target architecture; P2 = maintainability hardening; P3 = optional
+follow-up.
+
+### ARCH-001 — Record the current contracts and invariants [P0]
+
+* Inventory every route in `internal/httpapi/server.go`, including method,
+  query parameters, request JSON, response JSON, status codes, auth state,
+  unlocked-vault requirement, and audit behavior.
+* Record the current frontend API expectations from `frontend/src/api.ts` and
+  `frontend/src/App.tsx`.
+* Record vault encryption format, Argon2 parameters, AES-GCM envelope fields,
+  organization encryption behavior, and audit-event JSON schema.
+* Record the behavior of SQLite and PostgreSQL paths and the configured S3
+  endpoint/path-style behavior.
+* Acceptance: checked-in contract tables or tests exist before moving code;
+  no route is intentionally changed during extraction.
+
+### ARCH-002 — Add architecture documentation and dependency rules [P0]
+
+* Add `docs/backend-architecture.md` with the target package diagram, request
+  flow, ownership rules, and examples of where new code belongs.
+* Document the distinction between model, DTO, API use case, service, and
+  repository.
+* Add an import-boundary check or documented review rule preventing API code
+  from importing HTTP/SQL/AWS packages.
+* Acceptance: a new maintainer can trace one request through controller, API,
+  service, repository, and model without reading the entire server file.
+
+### MODEL-001 — Establish canonical domain models [P0]
+
+* Create `internal/model` types for user, session, vault, connection,
+  organization, preferences, audit event, object listing, object version,
+  multipart upload, and upload state.
+* Move business naming and invariants into models where appropriate, such as
+  connection identity, organization-qualified connection identity, valid
+  object kinds, and upload part ordering.
+* Remove transport-specific `json` tags from models unless a model is
+  intentionally part of a non-HTTP boundary.
+* Define safe/public projections so access and secret keys cannot leak through
+  ordinary model serialization.
+* Acceptance: no API response serializes a model containing secret credentials
+  by accident; model unit tests cover identifiers and validation rules.
+
+### DTO-001 — Define explicit HTTP request and response DTOs [P0]
+
+* Create DTOs per resource under `internal/httpapi/dto` or alongside each
+  controller.
+* Replace anonymous request structs and ad-hoc response maps for vault,
+  settings, connections, organizations, browse/search, versions, multipart,
+  uploads, downloads, authentication, and admin audit endpoints.
+* Add explicit mapper functions between DTOs and models/API commands.
+* Define one consistent error response DTO with a safe public message and an
+  internal error/correlation identifier that is never credential-bearing.
+* Acceptance: handler JSON shapes are tested and DTO mapping tests cover
+  omitted, empty, invalid, and secret-bearing fields.
+
+### DTO-002 — Implement explicit boundary mappers [P0]
+
+* Add handwritten mapping functions for every HTTP request/response boundary,
+  SQL row/domain boundary, and service/API boundary that needs translation.
+* Use domain constructors for creation and invariant enforcement; do not use
+  constructors as a substitute for transport mapping.
+* Keep mapping functions outside domain models so domain packages do not import
+  DTO or HTTP packages.
+* Add explicit public/safe projections for connections, organizations, audit
+  events, and any future credential-bearing model.
+* Add tests proving access keys, secret keys, master passwords, tokens, and
+  persistence-only fields cannot appear in UI/API DTOs.
+* Acceptance: no reflection-based mapper is introduced, no controller
+  serializes credential-bearing domain models directly, and every mapper has
+  focused tests for defaults, omitted fields, normalization, and redaction.
+
+### REPO-001 — Define repository interfaces at the API boundary [P0]
+
+* Define small interfaces consumed by API use cases, not a single giant
+  repository interface.
+* Required repositories:
+  * `VaultRepository` for the `vaults` table.
+  * `AuditEventRepository` for the `audit_events` table.
+  * `OrganizationRepository` for the `organizations` table.
+  * `UserPreferenceRepository` for the `user_preferences` table.
+* Keep session storage out of these repositories because it is currently
+  in-memory and has no database table; give it a session service/interface.
+* Keep multipart upload state out of these repositories because it is current
+  process state; isolate it behind an upload-state service/interface.
+* Acceptance: APIs depend on interfaces and can be tested with fakes; no API
+  package receives `*sqlx.DB` or `*vault.Store`.
+
+### REPO-002 — Split the current `vault.Store` by table [P0]
+
+* Extract SQL implementations for vaults, audit events, organizations, and
+  user preferences into separate repository files/types.
+* Centralize connection setup, SQL dialect rebinding, migrations, transaction
+  handling, and close behavior in a small database package.
+* Preserve the existing table names, columns, encrypted payload formats, and
+  audit JSON representation.
+* Remove table-specific methods from the monolithic store after callers move.
+* Acceptance: each core table has one repository; repository tests run against
+  SQLite and PostgreSQL-compatible integration coverage where supported.
+
+### REPO-003 — Separate persistence records from domain models [P1]
+
+* Introduce persistence records for encrypted vault envelopes, encrypted
+  organizations, audit rows, and preference rows.
+* Map persistence records to models in repository implementations.
+* Ensure SQL column names, JSON blobs, timestamps, and database-specific JSON
+  filtering remain repository concerns.
+* Acceptance: changing a SQL column or database JSON expression does not
+  require modifying an API DTO or business model.
+
+### SVC-001 — Define dedicated service interfaces [P0]
+
+* Define small interfaces for OIDC provider operations, session management,
+  vault cryptography, S3 storage, audit writing, logging, and upload-state
+  management.
+* Services should accept `context.Context`, return typed results/errors, and
+  avoid HTTP response writing.
+* Provide concrete production implementations and test fakes/mocks without
+  introducing a large mocking framework unless needed.
+* Acceptance: use cases can be unit-tested without external systems.
+
+### SVC-002 — Extract the S3 service [P0]
+
+* Move S3 client construction and all S3 workflows out of HTTP handlers.
+* Implement operations for connection validation, listing/search, folder
+  creation, object metadata/download/delete, versions, multipart listing,
+  init/part/complete/abort, and archive download.
+* Keep AWS SDK request/response types inside the S3 service; expose model-level
+  inputs and outputs to the API layer.
+* Centralize endpoint, path-style, region, credentials, TLS roots, pagination,
+  and S3 error translation.
+* Acceptance: no `aws-sdk-go-v2` import remains in controllers or API use cases;
+  S3 behavior is covered by fake-client tests and MinIO integration tests.
+
+### SVC-003 — Extract vault cryptography and vault lifecycle [P0]
+
+* Move Argon2, AES-GCM, envelope encoding, decrypt failure behavior, and
+  password validation into a vault service.
+* Keep repository responsibility limited to loading and storing encrypted
+  records.
+* Implement explicit use cases for status, create/unlock, lock, and destroy.
+* Ensure the master password remains in the session only as currently designed,
+  with clear documentation of memory and lock behavior.
+* Acceptance: crypto tests cover round trips, wrong passwords, malformed
+  envelopes, and compatibility with existing data; lifecycle tests cover new,
+  existing, locked, and deleted vaults.
+
+### SVC-004 — Extract authentication and session management [P1]
+
+* Separate OIDC protocol handling from session state and cookie mechanics.
+* Define an authenticated principal/session model consumed by API use cases.
+* Move group checks, admin checks, and unlock-state checks into reusable
+  authorization policies or API-layer guards.
+* Keep OIDC callback HTTP redirects/cookies in the controller or an explicitly
+  HTTP-facing auth adapter.
+* Acceptance: login, callback, logout, session expiry, group claims, and vault
+  lock behavior have isolated tests.
+
+### SVC-005 — Extract audit and logging services [P1]
+
+* Make audit recording a service/API dependency instead of a helper method on
+  `httpapi.Server`.
+* Keep `AuditEventRepository` responsible for persistence and the audit service
+  responsible for event construction, redaction, IDs, timestamps, and policy.
+* Separate application logging from audit logging; use structured logging with
+  request IDs and operation fields.
+* Preserve the audit forwarder as a separate process/service that consumes the
+  repository abstraction.
+* Acceptance: every existing audited action remains audited; tests prove that
+  secrets, passwords, JWTs, cookies, and object contents are rejected/redacted.
+
+### API-001 — Create the business API/use-case layer [P0]
+
+* Add use-case APIs that expose business operations rather than HTTP concerns.
+* Suggested boundaries:
+  * `AuthAPI`: login callback orchestration, current principal, logout.
+  * `VaultAPI`: status, unlock/create, lock, destroy.
+  * `ConnectionAPI`: list, create, test, update, delete, organization merge.
+  * `ObjectAPI`: browse, search, folder create, file metadata, delete,
+    versions, download.
+  * `UploadAPI`: single upload and multipart lifecycle.
+  * `OrganizationAPI`: admin list/create/update/delete and secret merging.
+  * `AuditAPI`: filtered event listing and action listing.
+  * `PreferencesAPI`: read/update user preferences.
+* Commands and results should use models or application-specific command/result
+  types, never `http.Request`, `http.ResponseWriter`, SQL rows, or AWS types.
+* Acceptance: controllers become thin adapters and each API has unit tests for
+  authorization, validation, orchestration, and error paths.
+
+### API-002 — Centralize business authorization and connection resolution [P0]
+
+* Move `session`, `unlocked`, `adminAllowed`, `withOrganizations`,
+  `organizationConfig`, and organization-connection protection out of the
+  HTTP server.
+* Define explicit policies for authenticated, unlocked, admin, provisioned
+  organization, and editable personal connection access.
+* Resolve an API connection once per use case and pass a safe connection model
+  to the S3 service.
+* Acceptance: authorization decisions are unit-tested independently of HTTP;
+  organization connections cannot be edited/deleted through any route.
+
+### HTTP-001 — Split the HTTP controller package by resource [P0]
+
+* Create separate controllers for auth, vault, connections, objects,
+  uploads, organizations, audit, preferences, health, and SPA serving.
+* Keep each handler short: decode DTO, call API, map error, encode DTO.
+* Move route registration into `router.go`; use chi route groups and middleware
+  for shared concerns.
+* Add request ID, recovery, access logging, content type, and size-limit
+  middleware where appropriate.
+* Acceptance: no controller contains SQL, AWS SDK calls, encryption, or a
+  multi-step business workflow; the old `Server` god object is removed.
+
+### HTTP-002 — Standardize HTTP error and response handling [P1]
+
+* Replace direct `http.Error` and scattered numeric statuses with a central
+  error-mapping policy.
+* Define typed domain/application errors for validation, authentication,
+  authorization, locked vault, not found, conflict, external dependency, and
+  internal failure.
+* Keep detailed causes in logs while returning safe client messages.
+* Acceptance: every route has tested status behavior and internal errors do not
+  reveal SQL, S3 credentials, filesystem paths, or cryptographic details.
+
+### HTTP-003 — Generate or maintain API contract documentation [P2]
+
+* Document the current JSON routes using OpenAPI or a maintained equivalent.
+* Include authentication, locked-vault responses, pagination, upload state,
+  download content types, and error DTOs.
+* Add contract validation in CI if the project adopts generated clients or an
+  OpenAPI tool.
+* Acceptance: frontend maintainers can discover request/response contracts
+  without reading controller code.
+
+### DB-001 — Make database lifecycle and transactions explicit [P1]
+
+* Add a database abstraction for opening, pinging, migrating, beginning
+  transactions, and closing.
+* Define transaction ownership at the API/use-case boundary for workflows that
+  update multiple records; repositories accept a transaction-scoped executor
+  or equivalent abstraction.
+* Preserve SQLite single-replica constraints and PostgreSQL behavior.
+* Add startup readiness checks and clear migration failure diagnostics.
+* Acceptance: multi-write operations have atomicity tests and no repository
+  silently starts an unrelated transaction.
+
+### DB-002 — Add migration versioning [P1]
+
+* Replace the current unconditional `CREATE TABLE IF NOT EXISTS` loop with
+  ordered, versioned migrations.
+* Record migration versions in a migrations table.
+* Test fresh database creation and upgrade from a representative existing
+  database for both supported drivers.
+* Acceptance: deployment can safely start against an existing database and
+  migrations are observable and repeatable.
+
+### DB-003 — Harden repository query behavior [P1]
+
+* Centralize SQL dialect differences, especially PostgreSQL JSON expressions and
+  placeholder rebinding.
+* Add context-aware query methods and bounded pagination.
+* Add deterministic ordering for every list operation.
+* Verify scan/rows errors and close behavior consistently.
+* Acceptance: repository tests cover empty results, malformed JSON, pagination
+  boundaries, concurrent access, and database errors.
+
+### UPLOAD-001 — Isolate multipart upload state [P1]
+
+* Move `uploadState`, mutexes, and multipart lifecycle bookkeeping out of the
+  HTTP server into an upload-state service.
+* Define ownership checks by user/session, expiry, cleanup, and maximum state
+  limits.
+* Decide and document whether uploads remain process-local or become durable
+  for multi-replica deployments; do not silently claim horizontal scaling.
+* Acceptance: concurrent users cannot access one another's upload state and
+  abandoned state is cleaned up.
+
+### CONFIG-001 — Separate configuration models from domain models [P1]
+
+* Stop aliasing `config.Organization` to `vault.Organization`.
+* Define configuration input models and map them to provisioned organization
+  models during startup.
+* Keep environment variable names, Secret selectors, and Helm JSON parsing in
+  the configuration package only.
+* Acceptance: changing Helm/configuration representation does not change the
+  public organization API model.
+
+### TEST-001 — Build the test pyramid around the new boundaries [P0]
+
+* Add model tests for validation and safe projections.
+* Add API/use-case tests with fake repositories and fake services.
+* Add controller tests using `httptest` and fake APIs, covering every route's
+  happy path and principal error statuses.
+* Add repository integration tests for SQLite and PostgreSQL.
+* Add S3 service contract tests against MinIO and a fake S3 client.
+* Retain a small number of end-to-end tests for OIDC, vault unlock, and a
+  representative S3 browse/upload/download flow.
+* Run race detection for session and upload-state services.
+* Acceptance: tests fail at the boundary where a regression occurs instead of
+  requiring a full-stack environment for ordinary business-rule changes.
+
+### TEST-002 — Add compatibility tests before moving handlers [P0]
+
+* Snapshot or assert JSON response shapes currently consumed by the frontend.
+* Test status codes for unauthenticated, locked, unauthorized, invalid, not
+  found, and upstream S3 failure cases.
+* Test organization provisioning and credential redaction.
+* Test audit event content byte-for-byte where persistence compatibility is
+  required.
+* Acceptance: extraction work can be reviewed as behavior-preserving commits.
+
+### OBS-001 — Add request-scoped observability [P2]
+
+* Add request IDs through middleware and pass context through API, services,
+  repositories, and S3 calls.
+* Emit structured operation logs with duration, result, user ID where safe,
+  connection ID, bucket, and request ID.
+* Never log passwords, access keys, secret keys, tokens, cookies, object data,
+  or raw request bodies.
+* Acceptance: a failed S3 request can be correlated from HTTP log to audit event
+  without exposing sensitive data.
+
+### SECURITY-001 — Review secret lifetime and redaction during extraction [P0]
+
+* Identify every path where master passwords and S3 credentials enter memory.
+* Ensure DTO mapping, logging, errors, audit events, traces, and test fixtures
+  cannot expose them.
+* Keep organization credentials backend-only and preserve current frontend
+  non-disclosure behavior.
+* Review lock, logout, session expiry, and error paths for secret retention.
+* Acceptance: security review signs off before deleting the old combined store
+  and handler paths.
+
+### MIGRATE-001 — Extract in vertical slices, not a big-bang rewrite [P0]
+
+Implement the migration in this order, keeping the application compiling and
+tested after each slice:
+
+1. Contract tests, models, DTOs, error types, and dependency rules.
+2. Database package and repository interfaces; extract preferences first.
+3. Audit repository/service and audit forwarder adapter.
+4. Vault repository plus vault cryptography/lifecycle API.
+5. Connection and organization API, including group resolution and redaction.
+6. S3 service and object API.
+7. Upload-state service and upload API.
+8. HTTP controllers and route/middleware split.
+9. Authentication/session service split.
+10. Remove `vault.Store` as a god repository and shrink `httpapi.Server` to
+    router/controller wiring.
+11. Update `cmd/mariner/main.go` to wire all dependencies explicitly.
+12. Remove dead code, update documentation, and perform a full compatibility
+    and security review.
+
+Acceptance: each slice has focused tests, a reviewable commit, and no period
+where the old and new paths write conflicting representations.
+
+### CLEANUP-001 — Remove legacy architectural ambiguity [P2]
+
+* Rename `internal/vault` if it no longer owns the vault domain and persistence
+  concerns together.
+* Remove aliases that obscure ownership, such as configuration types aliased
+  to vault types.
+* Remove generic helper methods from `Server` after their responsibilities move.
+* Add package comments for every new top-level internal package.
+* Add examples or short README files for repositories, services, APIs, and
+  controllers.
+* Acceptance: `go list -deps` and code review show the intended dependency
+  direction, and package names communicate responsibility to a new maintainer.
+
+### RELEASE-001 — Operational rollout and rollback plan [P1]
+
+* Verify the refactor against existing SQLite data and PostgreSQL data.
+* Verify existing encrypted vault envelopes remain readable and writable.
+* Run local Keycloak, MinIO, PostgreSQL, Helm, and restricted-Pod-Security
+  deployment validation.
+* Publish migration notes for operators, especially database migrations and
+  session/upload behavior.
+* Define rollback steps that do not delete the Mariner PVC or encrypted vault
+  data.
+* Acceptance: release checklist is green and a rollback has been rehearsed on
+  a disposable environment.
+
+Suggested issue sequencing
+---------------------------
+
+Phase 0: ARCH-001, ARCH-002, MODEL-001, DTO-001, TEST-002, SECURITY-001.
+
+Phase 1: REPO-001, REPO-002, REPO-003, DB-001, DB-002, DB-003.
+
+Phase 2: SVC-001, SVC-003, SVC-004, SVC-005, API-001, API-002.
+
+Phase 3: SVC-002, UPLOAD-001, CONFIG-001.
+
+Phase 4: HTTP-001, HTTP-002, HTTP-003, TEST-001, OBS-001.
+
+Phase 5: MIGRATE-001, CLEANUP-001, RELEASE-001.
+
+Definition of done for the rearchitecture
+------------------------------------------
+
+* `cmd/mariner` only composes concrete dependencies and starts processes.
+* HTTP controllers are transport adapters, not business-rule containers.
+* API/use-case packages contain the business workflows and are independently
+  testable.
+* Dedicated services own OIDC/session, vault cryptography, S3, audit, logging,
+  upload state, and future email integrations.
+* `vaults`, `audit_events`, `organizations`, and `user_preferences` each have
+  a dedicated repository.
+* Models, persistence records, and HTTP DTOs are distinct where their concerns
+  differ.
+* Existing API, security, encryption, audit, and deployment contracts are
+  covered by tests.
+* The backend is easier to change by a maintainer who only needs one resource
+  boundary at a time.
+
+Research references
+-------------------
+
+These primary references informed the package and dependency recommendations:
+
+* Go project/module organization:
+  https://go.dev/doc/modules/layout
+* Go package and module fundamentals:
+  https://go.dev/doc/code
+* chi router documentation and composable route/middleware model:
+  https://github.com/go-chi/docs
+* sqlx database/sql extensions and transaction usage:
+  https://github.com/jmoiron/sqlx
+* AWS SDK for Go v2 S3 examples and client construction:
+  https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/go_s3_code_examples.html
+  https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/using.html
+
