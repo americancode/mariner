@@ -89,7 +89,7 @@ func (s *Server) audit(session auth.Session, action, result string, fields map[s
 		}
 	}
 	if err := s.Audit.Write(event); err != nil {
-		slog.Error("audit write failed", "action", action, "error", err)
+		slog.Error("audit write failed", "action", action)
 	}
 }
 
@@ -374,7 +374,7 @@ func (s *Server) deleteAdminOrganization(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := s.organizationRepository().Delete(id); err != nil {
-		slog.Error("admin organization database delete failed", "error", err)
+		slog.Error("admin organization database delete failed")
 		fail(w, 500, err)
 		return
 	}
@@ -415,7 +415,7 @@ func auditTimeBoundary(value string, end bool) string {
 func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 	user, id, err := s.Auth.Callback(r)
 	if err != nil {
-		slog.Warn("authentication failure: OIDC callback rejected", "error", err)
+		slog.Warn("authentication failure: OIDC callback rejected")
 		fail(w, http.StatusUnauthorized, errors.New("authentication failed"))
 		return
 	}
@@ -1048,7 +1048,7 @@ func (s *Server) uploadInit(w http.ResponseWriter, r *http.Request) {
 	}
 	s.uploads[uploadID] = &uploadState{UserID: session.User.ID, Connection: c, Bucket: c.Bucket, Key: key, UploadID: uploadID, Parts: make(map[int32]model.UploadPart), PartPaths: make(map[int32]string), TempDir: tempDir}
 	s.uploadMu.Unlock()
-	slog.Info("multipart upload initialized", "upload_id", uploadID, "part_size", s.uploadPartSize(), "concurrency", s.uploadPartConcurrency(), "size", request.Size)
+	slog.Info("multipart upload initialized", "part_size", s.uploadPartSize(), "concurrency", s.uploadPartConcurrency())
 	write(w, map[string]any{"uploadId": uploadID, "key": key, "partSize": s.uploadPartSize(), "concurrency": s.uploadPartConcurrency()})
 }
 
@@ -1056,16 +1056,13 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	uploadID := r.URL.Query().Get("uploadId")
 	partNumber, parseErr := strconv.ParseInt(r.URL.Query().Get("partNumber"), 10, 32)
-	partFields := func() []any {
-		return []any{"upload_id", uploadID, "part_number", partNumber}
-	}
 	stageStarted := time.Now()
 	session, _, err := s.session(r)
 	if err != nil {
 		fail(w, http.StatusUnauthorized, err)
 		return
 	}
-	slog.Info("multipart part stage", append(partFields(), "stage", "session", "duration_ms", time.Since(stageStarted).Milliseconds())...)
+	slog.Info("multipart part stage", "stage", "session", "duration_ms", time.Since(stageStarted).Milliseconds())
 	if uploadID == "" || parseErr != nil || partNumber < 1 {
 		fail(w, http.StatusBadRequest, errors.New("upload ID and part number are required"))
 		return
@@ -1089,7 +1086,7 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusRequestEntityTooLarge, errors.New("upload part is too large"))
 		return
 	}
-	slog.Info("multipart part stage", append(partFields(), "stage", "read_request_body", "duration_ms", time.Since(stageStarted).Milliseconds(), "bytes", len(body), "content_length", r.ContentLength)...)
+	slog.Info("multipart part stage", "stage", "read_request_body", "duration_ms", time.Since(stageStarted).Milliseconds(), "bytes", len(body))
 	if s.Storage == nil {
 		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
@@ -1100,14 +1097,14 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadGateway, err)
 		return
 	}
-	slog.Info("multipart part stage", append(partFields(), "stage", "s3_upload_part", "duration_ms", time.Since(stageStarted).Milliseconds(), "bytes", len(body))...)
+	slog.Info("multipart part stage", "stage", "s3_upload_part", "duration_ms", time.Since(stageStarted).Milliseconds(), "bytes", len(body))
 	partPath := filepath.Join(state.TempDir, fmt.Sprintf("%08d.part", partNumber))
 	stageStarted = time.Now()
 	if err := os.WriteFile(partPath, body, 0600); err != nil {
 		fail(w, http.StatusInternalServerError, err)
 		return
 	}
-	slog.Info("multipart part stage", append(partFields(), "stage", "write_temp_part", "duration_ms", time.Since(stageStarted).Milliseconds(), "bytes", len(body))...)
+	slog.Info("multipart part stage", "stage", "write_temp_part", "duration_ms", time.Since(stageStarted).Milliseconds(), "bytes", len(body))
 	stageStarted = time.Now()
 	s.uploadMu.Lock()
 	if _, exists := state.Parts[int32(partNumber)]; exists {
@@ -1118,7 +1115,7 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 	state.Parts[int32(partNumber)] = model.UploadPart{ETag: etag, PartNumber: int32(partNumber)}
 	state.PartPaths[int32(partNumber)] = partPath
 	s.uploadMu.Unlock()
-	slog.Info("multipart part completed", append(partFields(), "duration_ms", time.Since(started).Milliseconds(), "bytes", len(body))...)
+	slog.Info("multipart part completed", "duration_ms", time.Since(started).Milliseconds(), "bytes", len(body))
 	write(w, map[string]any{"partNumber": partNumber, "etag": etag})
 }
 
@@ -1317,7 +1314,7 @@ func write(w http.ResponseWriter, value any) {
 }
 func fail(w http.ResponseWriter, status int, err error) {
 	if status >= http.StatusInternalServerError {
-		slog.Error("request failed", "status", status, "error", err)
+		slog.Error("request failed", "status", status)
 		err = errors.New("request could not be completed")
 	}
 	http.Error(w, err.Error(), status)

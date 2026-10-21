@@ -38,10 +38,7 @@ type rateLimiter struct {
 
 func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestID := r.Header.Get("X-Request-ID")
-		if requestID == "" {
-			requestID = uuid.NewString()
-		}
+		requestID := uuid.NewString()
 		w.Header().Set("X-Request-ID", requestID)
 		started := time.Now()
 		observed := &observedResponseWriter{ResponseWriter: w}
@@ -50,7 +47,7 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 			if status == 0 {
 				status = http.StatusOK
 			}
-			slog.Info("HTTP request", "request_id", requestID, "method", r.Method, "path", r.URL.Path, "status", status, "bytes", observed.bytes, "duration_ms", time.Since(started).Milliseconds(), "remote_addr", clientAddress(r))
+			slog.Info("HTTP request", "request_id", requestID, "status", status, "bytes", observed.bytes, "duration_ms", time.Since(started).Milliseconds())
 		}()
 		w = observed
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -67,7 +64,7 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 		if err != nil || !s.validCSRFToken(cookie.Value) {
 			value, tokenErr := s.newCSRFToken()
 			if tokenErr != nil {
-				slog.Error("CSRF token initialization failed", "request_id", requestID, "error", tokenErr)
+				slog.Error("CSRF token initialization failed", "request_id", requestID)
 				http.Error(w, "unable to initialize request security", http.StatusInternalServerError)
 				return
 			}
@@ -75,7 +72,7 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 			http.SetCookie(w, cookie)
 		}
 		if !csrf && (strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/auth/logout") && !hmac.Equal([]byte(cookie.Value), []byte(r.Header.Get(csrfHeaderName))) {
-			slog.Warn("CSRF validation failed", "request_id", requestID, "method", r.Method, "path", r.URL.Path)
+			slog.Warn("CSRF validation failed", "request_id", requestID)
 			http.Error(w, "missing or invalid CSRF token", http.StatusForbidden)
 			return
 		}
@@ -191,7 +188,7 @@ func (s *Server) sensitiveRateLimit(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		slog.Warn("rate limit exceeded", "method", r.Method, "path", r.URL.Path, "remote_addr", clientAddress(r), "limit", limit, "window", window.String())
+		slog.Warn("rate limit exceeded", "limit", limit, "window", window.String())
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 	})
 }

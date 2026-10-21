@@ -46,20 +46,14 @@ func (t *timedTransport) RoundTrip(request *http.Request) (*http.Response, error
 	response, err := t.base.RoundTrip(request)
 	duration := time.Since(started)
 	fields := []any{
-		"method", request.Method,
-		"host", request.URL.Host,
-		"path", request.URL.Path,
 		"duration_ms", duration.Milliseconds(),
-		"request_bytes", request.ContentLength,
 	}
 	if err != nil {
-		slog.Warn("S3 HTTP request failed", append(fields, "error", err.Error())...)
+		slog.Warn("S3 HTTP request failed", fields...)
 		return nil, err
 	}
 	fields = append(fields,
 		"status", response.StatusCode,
-		"request_id", response.Header.Get("x-amz-request-id"),
-		"extended_request_id", response.Header.Get("x-amz-id-2"),
 	)
 	if response.StatusCode >= 400 {
 		slog.Warn("S3 HTTP request returned an error", fields...)

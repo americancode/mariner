@@ -66,7 +66,7 @@ func (s *Service) partConcurrency() int {
 }
 
 func (s *Service) TestConnection(ctx context.Context, connection model.Connection) error {
-	slog.Info("S3 connection test started", "bucket", connection.Bucket, "region", connection.Region, "custom_endpoint", connection.Endpoint != "")
+	slog.Info("S3 connection test started")
 	client, err := s.client(ctx, connection)
 	if err != nil {
 		return err
@@ -76,7 +76,7 @@ func (s *Service) TestConnection(ctx context.Context, connection model.Connectio
 }
 
 func (s *Service) Browse(ctx context.Context, connection model.Connection, prefix, kind, continuationToken string) (model.BrowseResult, error) {
-	slog.Debug("S3 browse started", "bucket", connection.Bucket, "prefix", prefix, "kind", kind)
+	slog.Debug("S3 browse started")
 	parsedKind, err := validateKind(kind)
 	if err != nil {
 		return model.BrowseResult{}, err
@@ -118,7 +118,7 @@ func (s *Service) Browse(ctx context.Context, connection model.Connection, prefi
 }
 
 func (s *Service) Search(ctx context.Context, connection model.Connection, prefix, query, kind string) (model.BrowseResult, error) {
-	slog.Debug("S3 search started", "bucket", connection.Bucket, "prefix", prefix, "kind", kind)
+	slog.Debug("S3 search started")
 	parsedKind, err := validateKind(kind)
 	if err != nil {
 		return model.BrowseResult{}, err
@@ -170,7 +170,7 @@ func (s *Service) Search(ctx context.Context, connection model.Connection, prefi
 }
 
 func (s *Service) CreateFolder(ctx context.Context, connection model.Connection, prefix, name string) (string, error) {
-	slog.Info("S3 folder creation started", "bucket", connection.Bucket, "prefix", prefix)
+	slog.Info("S3 folder creation started")
 	name = strings.Trim(strings.TrimSpace(name), "/")
 	if name == "" {
 		return "", errors.New("folder name is required")
@@ -191,7 +191,7 @@ func (s *Service) CreateFolder(ctx context.Context, connection model.Connection,
 }
 
 func (s *Service) Versions(ctx context.Context, connection model.Connection, key string) ([]model.ObjectVersion, error) {
-	slog.Debug("S3 version listing started", "bucket", connection.Bucket, "key", key)
+	slog.Debug("S3 version listing started")
 	client, err := s.client(ctx, connection)
 	if err != nil {
 		return nil, err
@@ -226,7 +226,7 @@ func (s *Service) Versions(ctx context.Context, connection model.Connection, key
 }
 
 func (s *Service) DeleteVersion(ctx context.Context, connection model.Connection, key, versionID string) error {
-	slog.Info("S3 version deletion started", "bucket", connection.Bucket, "key", key)
+	slog.Info("S3 version deletion started")
 	client, err := s.client(ctx, connection)
 	if err != nil {
 		return err
@@ -236,7 +236,7 @@ func (s *Service) DeleteVersion(ctx context.Context, connection model.Connection
 }
 
 func (s *Service) OpenObject(ctx context.Context, connection model.Connection, key, versionID string) (Download, error) {
-	slog.Debug("S3 object download started", "bucket", connection.Bucket, "key", key)
+	slog.Debug("S3 object download started")
 	client, err := s.client(ctx, connection)
 	if err != nil {
 		return Download{}, err
@@ -253,7 +253,7 @@ func (s *Service) OpenObject(ctx context.Context, connection model.Connection, k
 }
 
 func (s *Service) DownloadArchive(ctx context.Context, connection model.Connection, prefix, format string, maxBytes int64, dst io.Writer) error {
-	slog.Info("S3 archive download started", "bucket", connection.Bucket, "prefix", prefix, "format", format, "max_bytes", maxBytes)
+	slog.Info("S3 archive download started")
 	if maxBytes <= 0 {
 		return errors.New("archive size limit must be positive")
 	}
@@ -399,7 +399,7 @@ func (s *Service) AbortMultipart(ctx context.Context, connection model.Connectio
 }
 
 func (s *Service) DeleteFile(ctx context.Context, connection model.Connection, key string) (string, error) {
-	slog.Info("S3 object deletion started", "bucket", connection.Bucket, "key", key)
+	slog.Info("S3 object deletion started")
 	client, err := s.client(ctx, connection)
 	if err != nil {
 		return "", err
@@ -463,7 +463,7 @@ func (s *Service) DeleteFile(ctx context.Context, connection model.Connection, k
 }
 
 func (s *Service) Upload(ctx context.Context, connection model.Connection, key string, file io.ReaderAt, size int64, contentType, checksum string) error {
-	slog.Info("S3 object upload started", "bucket", connection.Bucket, "key", key, "size", size, "content_type", contentType)
+	slog.Info("S3 object upload started")
 	client, err := s.client(ctx, connection)
 	if err != nil {
 		return err
@@ -476,7 +476,7 @@ func (s *Service) Upload(ctx context.Context, connection model.Connection, key s
 }
 
 func (s *Service) InitMultipart(ctx context.Context, connection model.Connection, key, contentType string) (string, error) {
-	slog.Info("S3 multipart upload initialized", "bucket", connection.Bucket, "key", key, "content_type", contentType)
+	slog.Info("S3 multipart upload initialized")
 	client, err := s.client(ctx, connection)
 	if err != nil {
 		return "", err
@@ -493,7 +493,7 @@ func (s *Service) InitMultipart(ctx context.Context, connection model.Connection
 }
 
 func (s *Service) UploadPart(ctx context.Context, connection model.Connection, uploadID, key string, partNumber int32, body []byte) (string, error) {
-	slog.Debug("S3 multipart part upload started", "bucket", connection.Bucket, "key", key, "part_number", partNumber, "size", len(body))
+	slog.Debug("S3 multipart part upload started", "size", len(body))
 	if int64(len(body)) > s.partSize() {
 		return "", errors.New("upload part is too large")
 	}
@@ -509,7 +509,7 @@ func (s *Service) UploadPart(ctx context.Context, connection model.Connection, u
 }
 
 func (s *Service) CompleteMultipart(ctx context.Context, connection model.Connection, uploadID, key string, parts []model.UploadPart) error {
-	slog.Info("S3 multipart upload completion started", "bucket", connection.Bucket, "key", key, "parts", len(parts))
+	slog.Info("S3 multipart upload completion started", "parts", len(parts))
 	client, err := s.client(ctx, connection)
 	if err != nil {
 		return err
