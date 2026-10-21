@@ -26,6 +26,7 @@ import {
 import { api, Connection, Item, MultipartUpload, ObjectVersion } from "./api";
 import { AdminPage as ModularAdminPage } from "./pages/AdminPage";
 import { errorMessage } from "./utils/errors";
+import { exactBytes, formatBytes } from "./utils/format";
 import { consumePromptUnlockAfterSignIn, signOut } from "./utils/navigation";
 import { useTheme } from "./hooks/useTheme";
 
@@ -2447,7 +2448,16 @@ function ExplorerRow({
           {item.name}
         </span>
         <span>{item.kind}</span>
-        <span>{item.size ? `${(item.size / 1024).toFixed(1)} KB` : "—"}</span>
+        <span
+          className="byte-size"
+          aria-label={item.kind === "file" ? exactBytes(item.size ?? 0) : undefined}
+          data-tooltip={
+            item.kind === "file" ? exactBytes(item.size ?? 0) : undefined
+          }
+          tabIndex={item.kind === "file" ? 0 : undefined}
+        >
+          {item.kind === "file" ? formatBytes(item.size ?? 0) : "—"}
+        </span>
         <span className="row-actions">
           <RowActionMenu
             label={`Actions for ${item.name}`}
@@ -2480,10 +2490,17 @@ function ExplorerRow({
                       : version.versionId}
                   </code>
                   <span>{new Date(version.lastModified).toLocaleString()}</span>
-                  <span>
-                    {version.deleteMarker
-                      ? "—"
-                      : `${(version.size / 1024).toFixed(1)} KB`}
+                  <span
+                    className="byte-size"
+                    aria-label={
+                      version.deleteMarker ? undefined : exactBytes(version.size)
+                    }
+                    data-tooltip={
+                      version.deleteMarker ? undefined : exactBytes(version.size)
+                    }
+                    tabIndex={version.deleteMarker ? undefined : 0}
+                  >
+                    {version.deleteMarker ? "—" : formatBytes(version.size)}
                   </span>
                   <span>
                     {version.deleteMarker

@@ -447,6 +447,36 @@ html[data-theme="dark"] .download-options button:focus-visible {
   gap: 8px;
   justify-content: flex-end;
 }
+.byte-size {
+  cursor: help;
+  justify-self: start;
+  position: relative;
+}
+.byte-size[data-tooltip]::after {
+  background: var(--panel, #17251d);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  bottom: calc(100% + 8px);
+  box-shadow: 0 6px 18px #0003;
+  color: var(--text);
+  content: attr(data-tooltip);
+  font-size: 12px;
+  font-weight: 500;
+  left: 0;
+  opacity: 0;
+  padding: 6px 8px;
+  pointer-events: none;
+  position: absolute;
+  transform: translateY(4px);
+  transition: opacity 120ms ease, transform 120ms ease;
+  white-space: nowrap;
+  z-index: 20;
+}
+.byte-size[data-tooltip]:hover::after,
+.byte-size[data-tooltip]:focus-visible::after {
+  opacity: 1;
+  transform: translateY(0);
+}
 .row-menu {
   position: relative;
 }
