@@ -22,20 +22,20 @@ func (f *fakeConnectionUseCase) List(string, string) ([]model.Connection, error)
 	return f.connections, nil
 }
 
-func (f *fakeConnectionUseCase) Create(_ context.Context, _, _ string, connection model.Connection) (string, error) {
+func (f *fakeConnectionUseCase) Create(_ context.Context, _, _ string, _ []string, connection model.Connection) (string, error) {
 	f.created = connection
 	return "connection-1", nil
 }
 
-func (f *fakeConnectionUseCase) Test(context.Context, string, string, model.Connection, bool) error {
+func (f *fakeConnectionUseCase) Test(context.Context, string, string, []string, model.Connection, bool) error {
 	return nil
 }
 
-func (f *fakeConnectionUseCase) Update(context.Context, string, string, model.Connection) error {
+func (f *fakeConnectionUseCase) Update(context.Context, string, string, []string, model.Connection) error {
 	return nil
 }
 
-func (f *fakeConnectionUseCase) Delete(string, string, string) error { return nil }
+func (f *fakeConnectionUseCase) Delete(string, string, []string, string) error { return nil }
 
 func testSession(*http.Request) (auth.Session, error) {
 	return auth.Session{User: auth.User{ID: "user-1"}, Password: "password"}, nil

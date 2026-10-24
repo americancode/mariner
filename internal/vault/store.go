@@ -36,7 +36,6 @@ type Store struct {
 	vaults          *VaultTableRepository
 	organizations   *OrganizationTableRepository
 	preferences     *UserPreferenceTableRepository
-	application     *ApplicationSettingsTableRepository
 	organizationKey string
 	audit           *AuditEventTableRepository
 }
@@ -59,10 +58,6 @@ func (s *Store) AuditRepository() *AuditEventTableRepository { return s.audit }
 
 func (s *Store) UserPreferenceRepository() *UserPreferenceTableRepository {
 	return s.preferences
-}
-
-func (s *Store) ApplicationSettingsRepository() *ApplicationSettingsTableRepository {
-	return s.application
 }
 
 func (s *Store) AuditCursor() (string, string, error) {
@@ -91,7 +86,6 @@ func OpenDatabase(driver, dir, databaseURL string) (*Store, error) {
 	store.vaults = newVaultTableRepository(db, &store.mu)
 	store.organizations = newOrganizationTableRepository(db, &store.mu, &store.organizationKey)
 	store.preferences = newUserPreferenceTableRepository(db)
-	store.application = newApplicationSettingsTableRepository(db, &store.mu)
 	store.audit = newAuditEventTableRepository(db, &store.mu)
 	if err = store.migrate("postgres"); err != nil {
 		db.Close()
@@ -112,7 +106,6 @@ func Open(dir string) (*Store, error) {
 	store.vaults = newVaultTableRepository(db, &store.mu)
 	store.organizations = newOrganizationTableRepository(db, &store.mu, &store.organizationKey)
 	store.preferences = newUserPreferenceTableRepository(db)
-	store.application = newApplicationSettingsTableRepository(db, &store.mu)
 	store.audit = newAuditEventTableRepository(db, &store.mu)
 	if err = store.migrate("sqlite"); err != nil {
 		db.Close()

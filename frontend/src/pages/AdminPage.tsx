@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useState } from "react";
 import { LoaderCircle } from "lucide-react";
 import { api, AuditEvent, Organization } from "../api";
 import { errorMessage } from "../utils/errors";
@@ -34,11 +34,14 @@ export function AdminPage() {
 }
 
 function AdminOverviewPage() {
-  const [maxGiB, setMaxGiB] = useState("5");
-  const [saved, setSaved] = useState(false);
-  const [error, setError] = useState("");
-  useEffect(() => { void api.adminSettings().then((settings) => setMaxGiB(String(settings.archiveMaxBytes / (1024 ** 3)))).catch((err) => setError(errorMessage(err))); }, []);
-  async function save(event: FormEvent) { event.preventDefault(); const value = Number(maxGiB); if (!Number.isFinite(value) || value <= 0) { setError("Archive limit must be greater than zero."); return; } try { await api.updateAdminSettings({ archiveMaxBytes: Math.floor(value * 1024 ** 3) }); setSaved(true); setError(""); } catch (err) { setError(errorMessage(err)); } }
+  const [migrationError, setMigrationError] = useState("");
+  async function importBundle(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try { await api.importExport(await file.text()); setMigrationError(""); window.location.reload(); }
+    catch (err) { setMigrationError(errorMessage(err)); }
+  }
   return (
     <section className="admin-landing">
       <span className="eyebrow">ADMINISTRATION</span><h1>Mariner administration</h1>
@@ -47,11 +50,12 @@ function AdminOverviewPage() {
         <a className="card admin-card" href="/admin/audit"><h2>Audit logs</h2><p>Search security and S3 activity with database-backed filters.</p></a>
         <a className="card admin-card" href="/admin/organizations"><h2>Organizations</h2><p>Configure groups and shared connections.</p></a>
       </div>
-      <form className="card org-form" onSubmit={save}>
-        <h2>Download limits</h2><p>Limit the total size of files included in generated ZIP and TGZ downloads.</p>
-        <label>Maximum archive size (GiB)<input type="number" min="0.001" step="0.001" value={maxGiB} onChange={(event) => setMaxGiB(event.target.value)} /></label>
-        <div className="modal-actions"><button className="button" type="submit">Save limit</button>{saved && <span className="test-success">Saved</span>}{error && <span className="field-error">{error}</span>}</div>
-      </form>
+      <section className="card org-form migration-card">
+        <h2>Migration</h2>
+        <p>Export encrypted Mariner data to move between SQLite and PostgreSQL. The destination must use the same vault passwords and organization encryption key.</p>
+        <div className="modal-actions"><a className="button" href="/api/admin/export" download="mariner-export-v1.json">Export Mariner data</a><label className="button file-button">Import Mariner data<input type="file" accept="application/json,.json" onChange={importBundle} /></label></div>
+        {migrationError && <p className="form-error" role="alert">{migrationError}</p>}
+      </section>
     </section>
   );
 }
@@ -72,8 +76,10 @@ function OrganizationForm({ organization, onChange, onCancel, onSubmit }: { orga
   const connections = Object.entries(organization.connections);
   const [testing, setTesting] = useState<string>();
   const [testResults, setTestResults] = useState<Record<string, string>>({});
+  const [groupInput, setGroupInput] = useState(() => organization.groups.join(", "));
+  useEffect(() => { setGroupInput(organization.groups.join(", ")); }, [organization.id]);
   function updateConnection(name: string, value: Partial<Organization["connections"][string]>) { onChange({ ...organization, connections: { ...organization.connections, [name]: { ...organization.connections[name], ...value } } }); }
-  return <form className="card org-form" onSubmit={onSubmit}><h2>{organization.id ? "Edit organization" : "New organization"}</h2><div className="form-grid"><label>ID<input required value={organization.id} disabled={organization.provisioned} onChange={(e) => onChange({ ...organization, id: e.target.value })} /></label><label>Name<input required value={organization.name} onChange={(e) => onChange({ ...organization, name: e.target.value })} /></label><label className="full-width">OIDC groups<span>comma-separated exact values</span><input value={organization.groups.join(", ")} onChange={(e) => onChange({ ...organization, groups: e.target.value.split(",").map((item) => item.trim()).filter(Boolean) })} /></label></div><div className="org-connections"><div className="org-section-heading"><h3>Default connections</h3><button type="button" className="secondary" onClick={() => { const name = `connection-${connections.length + 1}`; onChange({ ...organization, connections: { ...organization.connections, [name]: { id: name, name, bucket: "", region: "us-east-1", endpoint: "", prefix: "" } } }); }}>Add connection</button></div>{connections.map(([key, connection]) => <div className="connection-editor" key={key}><label>Name<input required value={connection.name} onChange={(e) => updateConnection(key, { name: e.target.value })} /></label><label>Bucket<input required value={connection.bucket} onChange={(e) => updateConnection(key, { bucket: e.target.value })} /></label><label>Endpoint<input value={connection.endpoint} onChange={(e) => updateConnection(key, { endpoint: e.target.value })} /></label><label>Region<input value={connection.region || "us-east-1"} onChange={(e) => updateConnection(key, { region: e.target.value })} placeholder="us-east-1" /></label><label>Access key<input type="text" placeholder="unchanged if blank" value={connection.accessKey || ""} onChange={(e) => updateConnection(key, { accessKey: e.target.value })} /></label><label>Secret key<input type="password" placeholder="unchanged if blank" value={connection.secretKey || ""} onChange={(e) => updateConnection(key, { secretKey: e.target.value })} /></label><div className="connection-test"><button type="button" className="secondary" disabled={testing === key || !connection.accessKey || !connection.secretKey} onClick={async () => { setTesting(key); setTestResults({ ...testResults, [key]: "Testing connection…" }); try { await api.testConnection({ ...connection, id: "", region: connection.region || "us-east-1" }); setTestResults({ ...testResults, [key]: "Connection successful" }); } catch (err) { setTestResults({ ...testResults, [key]: errorMessage(err) }); } finally { setTesting(undefined); } }}>{testing === key ? "Testing…" : "Test connection"}</button>{testResults[key] && <span className={testResults[key] === "Connection successful" ? "test-success" : "field-error"}>{testResults[key]}</span>}</div><button type="button" className="danger" onClick={() => { const next = { ...organization.connections }; delete next[key]; onChange({ ...organization, connections: next }); }}>Remove</button></div>)}</div><div className="modal-actions"><button type="button" className="secondary" onClick={onCancel}>Cancel</button><button className="button" type="submit">Save organization</button></div></form>;
+  return <form className="card org-form" onSubmit={onSubmit}><h2>{organization.id ? "Edit organization" : "New organization"}</h2><div className="form-grid"><label>ID<input required value={organization.id} disabled={organization.provisioned} onChange={(e) => onChange({ ...organization, id: e.target.value })} /></label><label>Name<input required value={organization.name} onChange={(e) => onChange({ ...organization, name: e.target.value })} /></label><label className="full-width">OIDC groups<span>comma-separated exact values</span><input value={groupInput} onChange={(e) => { setGroupInput(e.target.value); onChange({ ...organization, groups: e.target.value.split(",").map((item) => item.trim()).filter(Boolean) }); }} /></label></div><div className="org-connections"><div className="org-section-heading"><h3>Default connections</h3><button type="button" className="secondary" onClick={() => { const name = `connection-${connections.length + 1}`; onChange({ ...organization, connections: { ...organization.connections, [name]: { id: name, name, bucket: "", region: "us-east-1", endpoint: "", prefix: "" } } }); }}>Add connection</button></div>{connections.map(([key, connection]) => <div className="connection-editor" key={key}><label>Name<input required value={connection.name} onChange={(e) => updateConnection(key, { name: e.target.value })} /></label><label>Bucket<input required value={connection.bucket} onChange={(e) => updateConnection(key, { bucket: e.target.value })} /></label><label>Endpoint<input value={connection.endpoint} onChange={(e) => updateConnection(key, { endpoint: e.target.value })} /></label><label>Region<input value={connection.region || "us-east-1"} onChange={(e) => updateConnection(key, { region: e.target.value })} placeholder="us-east-1" /></label><label>Access key<input type="text" placeholder="unchanged if blank" value={connection.accessKey || ""} onChange={(e) => updateConnection(key, { accessKey: e.target.value })} /></label><label>Secret key<input type="password" placeholder="unchanged if blank" value={connection.secretKey || ""} onChange={(e) => updateConnection(key, { secretKey: e.target.value })} /></label><div className="connection-test"><button type="button" className="secondary" disabled={testing === key || !connection.accessKey || !connection.secretKey} onClick={async () => { setTesting(key); setTestResults({ ...testResults, [key]: "Testing connection…" }); try { await api.testConnection({ ...connection, id: "", region: connection.region || "us-east-1" }); setTestResults({ ...testResults, [key]: "Connection successful" }); } catch (err) { setTestResults({ ...testResults, [key]: errorMessage(err) }); } finally { setTesting(undefined); } }}>{testing === key ? "Testing…" : "Test connection"}</button>{testResults[key] && <span className={testResults[key] === "Connection successful" ? "test-success" : "field-error"}>{testResults[key]}</span>}</div><button type="button" className="danger" onClick={() => { const next = { ...organization.connections }; delete next[key]; onChange({ ...organization, connections: next }); }}>Remove</button></div>)}</div><div className="modal-actions"><button type="button" className="secondary" onClick={onCancel}>Cancel</button><button className="button" type="submit">Save organization</button></div></form>;
 }
 
 function AdminAuditPage() {

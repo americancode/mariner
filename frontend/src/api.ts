@@ -7,7 +7,12 @@ export type Connection = {
   region: string;
   prefix: string;
   endpoint?: string;
+  organization?: string;
+  organizationCanManage?: boolean;
+  groupPath?: string;
 };
+export type OrganizationOption = { id: string; name: string };
+export type ConnectionGroup = { organization?: string; path: string };
 export type Item = {
   name: string;
   key: string;
@@ -61,7 +66,6 @@ export type Organization = {
   provisioned: boolean;
   connections: Record<string, OrganizationConnection>;
 };
-export type ApplicationSettings = { archiveMaxBytes: number };
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const method = (init?.method ?? "GET").toUpperCase();
@@ -111,13 +115,6 @@ export const api = {
   auditActions: () => request<string[]>("/api/admin/audit/actions"),
   adminPreferences: () =>
     request<Record<string, boolean>>("/api/admin/preferences"),
-  adminSettings: () => request<ApplicationSettings>("/api/admin/settings"),
-  updateAdminSettings: (settings: ApplicationSettings) =>
-    request<ApplicationSettings>("/api/admin/settings", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(settings),
-    }),
   updateAdminPreferences: (preferences: Record<string, boolean>) =>
     request<Record<string, boolean>>("/api/admin/preferences", {
       method: "PUT",
@@ -125,6 +122,12 @@ export const api = {
       body: JSON.stringify(preferences),
     }),
   adminOrganizations: () => request<Organization[]>("/api/admin/organizations"),
+  importExport: (content: string) =>
+    request<{ ok: boolean; version: number }>("/api/admin/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: content,
+    }),
   createOrganization: (organization: Organization) =>
     request<Organization>("/api/admin/organizations", {
       method: "POST",
@@ -215,6 +218,22 @@ export const api = {
       { method: "DELETE" },
     ),
   connections: () => request<Connection[]>("/api/connections"),
+  organizations: () => request<OrganizationOption[]>("/api/organizations"),
+  connectionGroups: () => request<ConnectionGroup[]>("/api/connection-groups"),
+  createConnectionGroup: (value: ConnectionGroup) =>
+    request<ConnectionGroup>("/api/connection-groups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(value),
+    }),
+  renameConnectionGroup: (value: ConnectionGroup & { newPath: string }) =>
+    request<ConnectionGroup>("/api/connection-groups", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(value),
+    }),
+  deleteConnectionGroup: (group: ConnectionGroup) =>
+    request<void>(`/api/connection-groups?path=${encodeURIComponent(group.path)}&organization=${encodeURIComponent(group.organization ?? "")}`, { method: "DELETE" }),
   addConnection: (value: object) =>
     request<{ id: string }>("/api/connections", {
       method: "POST",

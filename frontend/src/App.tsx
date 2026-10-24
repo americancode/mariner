@@ -23,7 +23,7 @@ import {
   UnlockKeyhole,
   X,
 } from "lucide-react";
-import { api, Connection, Item, MultipartUpload, ObjectVersion } from "./api";
+import { api, Connection, ConnectionGroup, Item, MultipartUpload, ObjectVersion, OrganizationOption } from "./api";
 import { AdminPage as ModularAdminPage } from "./pages/AdminPage";
 import { errorMessage } from "./utils/errors";
 import { exactBytes, formatBytes } from "./utils/format";
@@ -62,6 +62,8 @@ type ConnectionForm = {
   endpoint: string;
   accessKey: string;
   secretKey: string;
+  organization: string;
+  groupPath: string;
 };
 type Activity = {
   id: string;
@@ -78,6 +80,10 @@ type ActivitySetter = React.Dispatch<React.SetStateAction<Activity[]>>;
 export function App() {
   const [user, setUser] = useState<User>();
   const [connections, setConnections] = useState<Connection[]>([]);
+  const [organizations, setOrganizations] = useState<OrganizationOption[]>([]);
+  const [connectionGroups, setConnectionGroups] = useState<ConnectionGroup[]>([]);
+  const [groupModalOpen, setGroupModalOpen] = useState(false);
+  const [groupRenameTarget, setGroupRenameTarget] = useState<ConnectionGroup>();
   const [activeConnection, setActiveConnection] = useState<Connection>();
   const [prefix, setPrefix] = useState("");
   const [items, setItems] = useState<Item[]>([]);
@@ -113,6 +119,12 @@ export function App() {
   useEffect(() => {
     if (user && !user.authenticated) window.location.assign("/auth/login");
   }, [user]);
+  useEffect(() => {
+    if (!vaultUnlocked) { setOrganizations([]); return; }
+    Promise.all([api.organizations(), api.connectionGroups()])
+      .then(([nextOrganizations, nextGroups]) => { setOrganizations(nextOrganizations); setConnectionGroups(nextGroups); })
+      .catch((err) => setError(errorMessage(err)));
+  }, [vaultUnlocked]);
   useEffect(() => {
     if (
       !user?.authenticated ||
@@ -223,6 +235,7 @@ export function App() {
       const created = await api.addConnection(value);
       const nextConnections = await api.connections();
       setConnections(nextConnections);
+      setConnectionGroups(await api.connectionGroups());
       setConnectionModalOpen(false);
       const saved = nextConnections.find(
         (connection) => connection.id === created.id,
@@ -237,7 +250,13 @@ export function App() {
       await api.updateConnection(value);
       const nextConnections = await api.connections();
       setConnections(nextConnections);
+      setConnectionGroups(await api.connectionGroups());
       setEditingConnection(undefined);
+      if (activeConnection?.id === value.id) {
+        setActiveConnection(undefined);
+        setItems([]);
+        setPrefix("");
+      }
       const saved = nextConnections.find(
         (connection) => connection.id === value.id,
       );
@@ -265,6 +284,27 @@ export function App() {
       setError(errorMessage(err));
     }
   }
+  async function createConnectionGroup(organization: string, path: string) {
+    try {
+      await api.createConnectionGroup({ organization: organization || undefined, path });
+      setConnectionGroups(await api.connectionGroups());
+      setGroupModalOpen(false);
+    } catch (err) { setError(errorMessage(err)); }
+  }
+  async function deleteConnectionGroup(group: ConnectionGroup) {
+    try { await api.deleteConnectionGroup(group); setConnectionGroups(await api.connectionGroups()); }
+    catch (err) { setError(errorMessage(err)); }
+  }
+  async function renameConnectionGroup(group: ConnectionGroup, newPath: string) {
+    try {
+      await api.renameConnectionGroup({ ...group, newPath });
+      const replacePath = (path: string) => path === group.path ? newPath : path.startsWith(`${group.path}/`) ? `${newPath}${path.slice(group.path.length)}` : path;
+      setConnectionGroups((current) => current.map((item) => item.organization === group.organization && (item.path === group.path || item.path.startsWith(`${group.path}/`)) ? { ...item, path: replacePath(item.path) } : item));
+      setConnections((current) => current.map((connection) => connection.organization === group.organization && connection.groupPath && (connection.groupPath === group.path || connection.groupPath.startsWith(`${group.path}/`)) ? { ...connection, groupPath: replacePath(connection.groupPath) } : connection));
+      setGroupRenameTarget(undefined);
+    }
+    catch (err) { setError(errorMessage(err)); }
+  }
 
   if (!user) return <main className="center">Loading…</main>;
   if (!user.authenticated)
@@ -282,6 +322,11 @@ export function App() {
         onAddConnection={() => setConnectionModalOpen(true)}
         onEditConnection={setEditingConnection}
         onDeleteConnection={deleteConnection}
+        organizations={organizations}
+        groups={connectionGroups}
+        onNewGroup={() => setGroupModalOpen(true)}
+        onDeleteGroup={deleteConnectionGroup}
+        onRenameGroup={setGroupRenameTarget}
         darkMode={darkMode}
         vaultUnlocked={vaultUnlocked}
         onUnlock={() => setUnlockOpen(true)}
@@ -360,6 +405,7 @@ export function App() {
             setVaultExists(false);
             setVaultUnlocked(false);
             setConnections([]);
+            setConnectionGroups([]);
             setActiveConnection(undefined);
             setPrefix("");
             setItems([]);
@@ -385,6 +431,8 @@ export function App() {
           onCancel={() => setConnectionModalOpen(false)}
           onSubmit={addConnection}
           onTest={api.testConnection}
+          organizations={organizations}
+          groups={connectionGroups}
         />
       )}
       {editingConnection && (
@@ -393,6 +441,8 @@ export function App() {
           onCancel={() => setEditingConnection(undefined)}
           onSubmit={updateConnection}
           onTest={api.testConnection}
+          organizations={organizations}
+          groups={connectionGroups}
         />
       )}
       {connectionDeleteTarget && (
@@ -400,6 +450,20 @@ export function App() {
           connection={connectionDeleteTarget}
           onCancel={() => setConnectionDeleteTarget(undefined)}
           onConfirm={confirmDeleteConnection}
+        />
+      )}
+      {groupModalOpen && (
+        <ConnectionGroupModal
+          organizations={organizations}
+          onCancel={() => setGroupModalOpen(false)}
+          onSubmit={createConnectionGroup}
+        />
+      )}
+      {groupRenameTarget && (
+        <RenameConnectionGroupModal
+          group={groupRenameTarget}
+          onCancel={() => setGroupRenameTarget(undefined)}
+          onSubmit={(newPath) => renameConnectionGroup(groupRenameTarget, newPath)}
         />
       )}
       {error && (
@@ -428,6 +492,51 @@ function Login() {
   );
 }
 
+type ConnectionTreeNode = { name: string; path: string; children: Map<string, ConnectionTreeNode>; connections: Connection[] };
+
+function ConnectionTree({ scope, label, organization, connections, groups, activeConnection, vaultUnlocked, onBrowse, onEditConnection, onDeleteConnection, onDeleteGroup, onRenameGroup }: {
+  scope: string;
+  label: string;
+  organization: string;
+  connections: Connection[];
+  groups: string[];
+  activeConnection?: Connection;
+  vaultUnlocked: boolean;
+  onBrowse: (connection: Connection) => void;
+  onEditConnection: (connection: Connection) => void;
+  onDeleteConnection: (connection: Connection) => void;
+  onDeleteGroup: (group: ConnectionGroup) => void;
+  onRenameGroup: (group: ConnectionGroup) => void;
+}) {
+  const [open, setOpen] = useState<Record<string, boolean>>({ [scope]: true });
+  const root: ConnectionTreeNode = { name: label, path: "", children: new Map(), connections: [] };
+  function ensure(path: string) {
+    let node = root;
+    let current = "";
+    for (const name of path ? path.split("/") : []) {
+      current = current ? `${current}/${name}` : name;
+      if (!node.children.has(name)) node.children.set(name, { name, path: current, children: new Map(), connections: [] });
+      node = node.children.get(name)!;
+    }
+    return node;
+  }
+  groups.forEach(ensure);
+  connections.forEach((connection) => (connection.groupPath ? ensure(connection.groupPath).connections : root.connections).push(connection));
+  const renderConnection = (connection: Connection, depth: number) => <button disabled={!vaultUnlocked} style={{ paddingLeft: `${18 + depth * 16}px` }} className={activeConnection?.id === connection.id ? "connection active" : "connection"} onClick={() => onBrowse(connection)} key={connection.id}>
+    <span className="connection-label">{connection.name}</span>
+    {(!connection.organization || connection.organizationCanManage) && <span className="connection-actions"><span role="button" tabIndex={0} aria-label={`Edit ${connection.name}`} onClick={(event) => { event.stopPropagation(); onEditConnection(connection); }} onKeyDown={(event) => { if (event.key === "Enter") { event.stopPropagation(); onEditConnection(connection); } }}><Pencil size={14} /></span><span role="button" tabIndex={0} aria-label={`Delete ${connection.name}`} onClick={(event) => { event.stopPropagation(); onDeleteConnection(connection); }} onKeyDown={(event) => { if (event.key === "Enter") onDeleteConnection(connection); }}><Trash2 size={14} /></span></span>}
+  </button>;
+  function renderNode(node: ConnectionTreeNode, depth: number) {
+    const children = Array.from(node.children.values()).sort((a, b) => a.name.localeCompare(b.name));
+    const isOpen = node.path ? open[node.path] === true : open[scope] !== false;
+    return <div key={node.path || scope} className="connection-tree-node">
+      {(node.path || node === root) && <button className="connection-group" style={{ paddingLeft: `${10 + depth * 12}px` }} onClick={() => setOpen((current) => ({ ...current, [node.path || scope]: !isOpen }))}><ChevronDown className={isOpen ? "" : "collapsed"} size={14} /><Folder size={14} />{node.name}<small>{node.connections.length + children.length}</small>{node.path && <><span className="connection-group-action" role="button" tabIndex={0} aria-label={`Rename ${node.name} group`} onClick={(event) => { event.stopPropagation(); onRenameGroup({ organization: organization || undefined, path: node.path }); }} onKeyDown={(event) => { if (event.key === "Enter") { event.stopPropagation(); onRenameGroup({ organization: organization || undefined, path: node.path }); } }}><Pencil size={13} /></span><span className="connection-group-action" role="button" tabIndex={0} aria-label={`Delete ${node.name} group`} onClick={(event) => { event.stopPropagation(); onDeleteGroup({ organization: organization || undefined, path: node.path }); }} onKeyDown={(event) => { if (event.key === "Enter") { event.stopPropagation(); onDeleteGroup({ organization: organization || undefined, path: node.path }); } }}><Trash2 size={13} /></span></>}</button>}
+      {isOpen && <div className={node.path || node === root ? "connection-tree-children nested" : "connection-tree-children"}>{node.connections.sort((a, b) => a.name.localeCompare(b.name)).map((connection) => renderConnection(connection, node.path ? node.path.split("/").length : 0))}{children.map((child) => renderNode(child, depth + 1))}</div>}
+    </div>;
+  }
+  return <section className="connection-scope">{renderNode(root, 0)}</section>;
+}
+
 function Sidebar({
   userName,
   isAdmin,
@@ -437,6 +546,11 @@ function Sidebar({
   onAddConnection,
   onEditConnection,
   onDeleteConnection,
+  organizations,
+  groups,
+  onNewGroup,
+  onDeleteGroup,
+  onRenameGroup,
   darkMode,
   vaultUnlocked,
   onUnlock,
@@ -450,6 +564,11 @@ function Sidebar({
   onAddConnection: () => void;
   onEditConnection: (connection: Connection) => void;
   onDeleteConnection: (connection: Connection) => void;
+  organizations: OrganizationOption[];
+  groups: ConnectionGroup[];
+  onNewGroup: () => void;
+  onDeleteGroup: (group: ConnectionGroup) => void;
+  onRenameGroup: (group: ConnectionGroup) => void;
   darkMode: boolean;
   vaultUnlocked: boolean;
   onUnlock: () => void;
@@ -462,61 +581,8 @@ function Sidebar({
       <p>{userName?.trim() || "OIDC user"}</p>
       <span className="eyebrow">CONNECTIONS</span>
       <div className="connection-list">
-        {connections.map((connection) => (
-          <button
-            disabled={!vaultUnlocked}
-            className={
-              activeConnection?.id === connection.id
-                ? "connection active"
-                : "connection"
-            }
-            onClick={() => onBrowse(connection)}
-            key={connection.id}
-          >
-            <span className="connection-label">
-              {connection.name}
-              <small>{connection.bucket}</small>
-            </span>
-            {!connection.id.includes(":") && (
-              <span className="connection-actions">
-                <span
-                  role="button"
-                  tabIndex={0}
-                  aria-label={`Edit ${connection.name}`}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onEditConnection(connection);
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.stopPropagation();
-                      onEditConnection(connection);
-                    }
-                  }}
-                >
-                  <Pencil size={14} />
-                </span>
-                <span
-                  role="button"
-                  tabIndex={0}
-                  aria-label={`Delete ${connection.name}`}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onDeleteConnection(connection);
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.stopPropagation();
-                      onDeleteConnection(connection);
-                    }
-                  }}
-                >
-                  <Trash2 size={14} />
-                </span>
-              </span>
-            )}
-          </button>
-        ))}
+        <ConnectionTree scope="personal" label="Personal" organization="" connections={connections.filter((connection) => !connection.organization)} groups={groups.filter((group) => !group.organization).map((group) => group.path)} activeConnection={activeConnection} vaultUnlocked={vaultUnlocked} onBrowse={onBrowse} onEditConnection={onEditConnection} onDeleteConnection={onDeleteConnection} onDeleteGroup={onDeleteGroup} onRenameGroup={onRenameGroup} />
+        {organizations.map((organization) => <ConnectionTree key={organization.id} scope={organization.id} label={organization.name} organization={organization.id} connections={connections.filter((connection) => connection.organization === organization.id)} groups={groups.filter((group) => group.organization === organization.id).map((group) => group.path)} activeConnection={activeConnection} vaultUnlocked={vaultUnlocked} onBrowse={onBrowse} onEditConnection={onEditConnection} onDeleteConnection={onDeleteConnection} onDeleteGroup={onDeleteGroup} onRenameGroup={onRenameGroup} />)}
       </div>
       <button
         className="secondary add"
@@ -529,6 +595,9 @@ function Sidebar({
         onClick={onAddConnection}
       >
         <Plus size={16} /> Add connection
+      </button>
+      <button className="secondary add" disabled={!vaultUnlocked} onClick={onNewGroup}>
+        <FolderPlus size={16} /> New group
       </button>
       <div className="sidebar-footer">
         {isAdmin && (
@@ -867,11 +936,15 @@ function ConnectionModal({
   onCancel,
   onSubmit,
   onTest,
+  organizations,
+  groups,
 }: {
   connection?: Connection;
   onCancel: () => void;
   onSubmit: (value: ConnectionForm) => Promise<void>;
   onTest: (value: ConnectionForm) => Promise<void>;
+  organizations: OrganizationOption[];
+  groups: ConnectionGroup[];
 }) {
   const [form, setForm] = useState<ConnectionForm>({
     id: connection?.id,
@@ -882,6 +955,8 @@ function ConnectionModal({
     endpoint: connection?.endpoint ?? "",
     accessKey: "",
     secretKey: "",
+    organization: connection?.organization ?? "",
+    groupPath: connection?.groupPath ?? "",
   });
   const [tested, setTested] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -910,7 +985,11 @@ function ConnectionModal({
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (!validateForm()) return;
-    if (!tested) return;
+    // Existing connections keep their encrypted credentials server-side when
+    // the credential fields are blank. The update endpoint merges those
+    // credentials and validates the resulting connection, so moving an
+    // existing connection does not require re-entering or retesting its keys.
+    if (!connection && !tested) return;
     await onSubmit(form);
   }
   async function test() {
@@ -959,6 +1038,35 @@ function ConnectionModal({
             : "Connection credentials are encrypted in your personal vault."}
         </p>
         <div className="form-grid">
+          <label className="full-width">
+            Save location
+            <span className="form-select-wrap">
+              <select
+                value={form.organization}
+                onChange={(event) => {
+                  setForm({ ...form, organization: event.target.value, groupPath: "" });
+                  setTested(false);
+                  setTestError("");
+                }}
+              >
+                <option value="">Personal vault</option>
+                {organizations.map((organization) => (
+                  <option key={organization.id} value={organization.id}>
+                    {organization.name}
+                  </option>
+                ))}
+              </select>
+            </span>
+          </label>
+          <label className="full-width">
+            Group <span>(optional)</span>
+            <span className="form-select-wrap">
+              <select value={form.groupPath} onChange={(event) => { setForm({ ...form, groupPath: event.target.value }); setTested(false); setTestError(""); }}>
+                <option value="">Ungrouped</option>
+                {groups.filter((group) => (group.organization ?? "") === form.organization).map((group) => <option key={group.path} value={group.path}>{group.path}</option>)}
+              </select>
+            </span>
+          </label>
           <label>
             Connection name <span className="required">(required)</span>
             <input
@@ -1053,7 +1161,7 @@ function ConnectionModal({
                 ? "Connection tested"
                 : "Test connection"}
           </button>
-          <button type="submit" className="button" disabled={!tested}>
+          <button type="submit" className="button" disabled={!connection && !tested}>
             {connection ? "Save changes" : "Save connection"}
           </button>
         </div>
@@ -1952,6 +2060,30 @@ function DeleteFileModal({
       </div>
     </div>
   );
+}
+
+function ConnectionGroupModal({ organizations, onCancel, onSubmit }: { organizations: OrganizationOption[]; onCancel: () => void; onSubmit: (organization: string, path: string) => Promise<void> }) {
+  const [organization, setOrganization] = useState("");
+  const [path, setPath] = useState("");
+  const [error, setError] = useState("");
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!path.trim()) { setError("Group path is required."); return; }
+    await onSubmit(organization, path.trim());
+  }
+  return <div className="modal-backdrop"><form className="card small-modal" onSubmit={submit}><div className="modal-heading"><div><span className="eyebrow">NEW GROUP</span><h2>Create connection group</h2></div><button type="button" className="modal-close" onClick={onCancel} aria-label="Close">×</button></div><p className="modal-description">Use slash-separated names to create nested groups, up to five levels deep.</p><div className="form-grid"><label className="full-width">Location<span className="form-select-wrap"><select value={organization} onChange={(event) => setOrganization(event.target.value)}><option value="">Personal vault</option>{organizations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></span></label><label className="full-width">Group path<input autoFocus value={path} onChange={(event) => setPath(event.target.value)} placeholder="Engineering/Production" /></label></div><div className="modal-actions"><button type="button" className="secondary" onClick={onCancel}>Cancel</button><button type="submit" className="button">Create group</button></div>{error && <p className="form-error" role="alert">{error}</p>}</form></div>;
+}
+
+function RenameConnectionGroupModal({ group, onCancel, onSubmit }: { group: ConnectionGroup; onCancel: () => void; onSubmit: (newPath: string) => Promise<void> }) {
+  const [path, setPath] = useState(group.path);
+  const [error, setError] = useState("");
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    const next = path.trim();
+    if (!next) { setError("Group path is required."); return; }
+    try { await onSubmit(next); } catch (err) { setError(errorMessage(err)); }
+  }
+  return <div className="modal-backdrop"><form className="card small-modal" onSubmit={submit}><div className="modal-heading"><div><span className="eyebrow">EDIT GROUP</span><h2>Rename connection group</h2></div><button type="button" className="modal-close" onClick={onCancel} aria-label="Close">×</button></div><p className="modal-description">Rename this group and keep its connections and nested groups together.</p><div className="form-grid"><label className="full-width">Group path<input autoFocus value={path} onChange={(event) => setPath(event.target.value)} /></label></div><div className="modal-actions"><button type="button" className="secondary" onClick={onCancel}>Cancel</button><button type="submit" className="button">Save name</button></div>{error && <p className="form-error" role="alert">{error}</p>}</form></div>;
 }
 
 function DeleteConnectionModal({

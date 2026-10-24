@@ -26,13 +26,14 @@ data:
   RATE_LIMIT_CONNECTION_TEST: {{ default 30 .Values.rateLimit.connectionTestPerWindow | quote }}
   UPLOAD_PART_SIZE: {{ default 16777216 .Values.upload.multipart.partSize | quote }}
   UPLOAD_PART_CONCURRENCY: {{ default 1 .Values.upload.multipart.concurrency | quote }}
+  ARCHIVE_MAX_BYTES: {{ default 5368709120 .Values.download.archiveMaxBytes | quote }}
   LOG_LEVEL: {{ default "info" .Values.logging.level | quote }}
   {{- $organizations := dict }}
   {{- range $organizationName, $configuredOrg := .Values.organizations }}
   {{- $org := $configuredOrg }}
   {{- $connections := dict }}
   {{- range $connectionName, $configured := $org.connections }}
-  {{- $connection := dict "id" (default $connectionName $configured.id) "name" (default $connectionName $configured.name) "bucket" $configured.bucket "region" (default "us-east-1" $configured.region) "prefix" (default "" $configured.prefix) "endpoint" (default "" $configured.endpoint) }}
+  {{- $connection := dict "id" (default $connectionName $configured.id) "name" (default $connectionName $configured.name) "bucket" $configured.bucket "region" (default "us-east-1" $configured.region) "prefix" (default "" $configured.prefix) "endpoint" (default "" $configured.endpoint) "groupPath" (default "" $configured.groupPath) }}
   {{- $orgKey := upper (replace "-" "_" (default $organizationName $org.id)) }}
   {{- $connKey := upper (replace "-" "_" (default $connectionName $configured.id)) }}
   {{- $_ := set $connection "accessKeyEnv" (printf "MARINER_ORG_%s_CONN_%s_ACCESS_KEY" $orgKey $connKey) }}

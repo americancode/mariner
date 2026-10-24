@@ -95,12 +95,16 @@ aside .eyebrow {
   color: inherit;
   text-align: left;
   border-radius: 9px;
-  padding: 11px 10px;
+  padding-bottom: 7px;
+  padding-right: 8px;
+  padding-top: 7px;
   cursor: pointer;
   font: inherit;
+  font-size: 15px;
+  font-weight: 500;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   justify-content: space-between;
 }
 .connection.active,
@@ -114,7 +118,8 @@ aside .eyebrow {
 .connection small {
   display: block;
   color: #9ac3a8;
-  margin-top: 3px;
+  font-size: 11px;
+  margin-top: 2px;
 }
 .connection-label {
   min-width: 0;
@@ -124,6 +129,66 @@ aside .eyebrow {
   overflow-y: auto;
   scrollbar-width: thin;
   width: 100%;
+}
+.connection-scope {
+  display: grid;
+  gap: 2px;
+}
+.connection-group {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: var(--ink);
+  cursor: pointer;
+  display: flex;
+  font-size: 16px;
+  font-weight: 800;
+  gap: 7px;
+  min-height: 30px;
+  padding-bottom: 6px;
+  padding-right: 8px;
+  padding-top: 6px;
+  text-align: left;
+  width: 100%;
+}
+.connection-group:hover,
+.connection-group:focus-visible {
+  color: var(--green);
+  outline: none;
+}
+.connection-group svg:first-child {
+  transition: transform 120ms ease;
+}
+.connection-group svg.collapsed {
+  transform: rotate(-90deg);
+}
+.connection-group small {
+  color: var(--muted);
+  margin-left: auto;
+}
+.connection-group-action {
+  color: var(--muted);
+  display: flex;
+  margin-left: 4px;
+}
+.connection-group-action:hover,
+.connection-group-action:focus-visible {
+  color: var(--danger, #a43e32);
+  outline: none;
+}
+.connection-group-action:first-of-type:hover,
+.connection-group-action:first-of-type:focus-visible {
+  color: var(--green);
+}
+.connection-tree-children.nested {
+  border-left: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  margin-left: 16px;
+}
+.connection-scope > .connection-tree-node > .connection-group {
+  color: #c6e3d0;
+  font-size: 17px;
+  letter-spacing: 0.01em;
+  margin-bottom: 2px;
 }
 .connection {
   width: 100%;
@@ -1155,13 +1220,30 @@ html[data-theme="dark"] .activity-progress {
   width: 100%;
 }
 .form-grid select {
+  appearance: none;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
   color: var(--text);
   font: inherit;
-  padding: 11px 12px;
+  padding: 11px 42px 11px 12px;
   width: 100%;
+}
+.form-select-wrap {
+  display: block;
+  position: relative;
+}
+.form-select-wrap::after {
+  border-bottom: 2px solid var(--green);
+  border-right: 2px solid var(--green);
+  content: "";
+  height: 8px;
+  pointer-events: none;
+  position: absolute;
+  right: 17px;
+  top: 50%;
+  transform: translateY(-65%) rotate(45deg);
+  width: 8px;
 }
 .form-grid input:focus,
 .password-field input:focus {
@@ -1176,6 +1258,12 @@ html[data-theme="dark"] .activity-progress {
   justify-content: flex-end;
   gap: 10px;
   margin-top: 26px;
+}
+.file-button {
+  cursor: pointer;
+}
+.file-button input {
+  display: none;
 }
 .admin-layout {
   display: grid;

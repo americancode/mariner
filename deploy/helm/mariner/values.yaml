@@ -22,6 +22,9 @@ upload:
   multipart:
     partSize: 16777216
     concurrency: 1
+download:
+  # Maximum total size of generated ZIP/TGZ downloads, in bytes.
+  archiveMaxBytes: 5368709120
 podSecurityContext:
   fsGroup: 65532
   seccompProfile:

@@ -13,11 +13,12 @@ func TestConnectionFromRequestPreservesWriteFields(t *testing.T) {
 	connection, err := ConnectionFromRequest(dto.ConnectionRequest{
 		ID: "connection-1", Name: "Demo", Bucket: "bucket", Region: "us-east-1",
 		Endpoint: "https://s3.example.test", AccessKey: "access", SecretKey: "secret", Prefix: "prefix/",
+		GroupPath: "Engineering/Production",
 	})
 	if err != nil {
 		t.Fatalf("ConnectionFromRequest returned error: %v", err)
 	}
-	if connection.ID != "connection-1" || connection.SecretKey != "secret" || connection.Prefix != "prefix/" {
+	if connection.ID != "connection-1" || connection.SecretKey != "secret" || connection.Prefix != "prefix/" || connection.GroupPath != "Engineering/Production" {
 		t.Fatalf("connection = %+v, missing write fields", connection)
 	}
 }

@@ -25,3 +25,21 @@ func TestNewConnectionTrimsRequiredFields(t *testing.T) {
 		t.Fatalf("connection = %+v, want trimmed required fields", connection)
 	}
 }
+
+func TestConnectionGroupPathAllowsFiveLevelsAndRejectsSix(t *testing.T) {
+	if err := ValidateConnectionGroupPath("one/two/three/four/five"); err != nil {
+		t.Fatalf("five-level path rejected: %v", err)
+	}
+	if err := ValidateConnectionGroupPath("one/two/three/four/five/six"); err == nil {
+		t.Fatal("six-level path accepted")
+	}
+}
+
+func TestConnectionGroupContainsOnlyMatchesDescendants(t *testing.T) {
+	if !ConnectionGroupContains("team/prod", "team/prod/archive") {
+		t.Fatal("descendant path was not recognized")
+	}
+	if ConnectionGroupContains("team/prod", "team/product") {
+		t.Fatal("similar path was treated as a descendant")
+	}
+}

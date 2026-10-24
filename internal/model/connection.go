@@ -17,6 +17,37 @@ type Connection struct {
 	AccessKey string `json:"accessKey"`
 	SecretKey string `json:"secretKey"`
 	Prefix    string `json:"prefix"`
+	GroupPath string `json:"groupPath,omitempty"`
+	// Organization is empty for a personal-vault connection. It is the
+	// organization ID for a shared connection.
+	Organization          string `json:"organization,omitempty"`
+	OrganizationCanManage bool   `json:"-"`
+}
+
+const MaxConnectionGroupDepth = 5
+
+func ValidateConnectionGroupPath(path string) error {
+	if path == "" {
+		return nil
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) > MaxConnectionGroupDepth {
+		return errors.New("connection group nesting cannot exceed five levels")
+	}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || part == "." || part == ".." {
+			return errors.New("connection group names must be non-empty and safe")
+		}
+		if strings.ContainsAny(part, "\\\r\n\t") {
+			return errors.New("connection group names contain invalid characters")
+		}
+	}
+	return nil
+}
+
+func ConnectionGroupContains(parent, child string) bool {
+	return child == parent || (parent != "" && strings.HasPrefix(child, parent+"/"))
 }
 
 // NewConnection creates a connection with the minimum business invariants

@@ -20,10 +20,12 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"mariner/internal/api"
 	"mariner/internal/audit"
 	"mariner/internal/auth"
 	"mariner/internal/config"
 	connectioncontroller "mariner/internal/httpapi/controller"
+	"mariner/internal/httpapi/dto"
 	"mariner/internal/httpapi/mapper"
 	"mariner/internal/model"
 	"mariner/internal/repository"
@@ -37,7 +39,6 @@ type Server struct {
 	AuditRepo               repository.AuditEventRepository
 	OrganizationRepo        repository.OrganizationRepository
 	PreferenceRepo          repository.UserPreferenceRepository
-	ApplicationSettingsRepo repository.ApplicationSettingsRepository
 	Storage                 *s3service.Service
 	Audit                   *audit.Logger
 	AuditAdminGroup         string
@@ -54,6 +55,7 @@ type Server struct {
 	ConnectionTestRateLimit int
 	UploadPartSize          int64
 	UploadPartConcurrency   int
+	ArchiveMaxBytes         int64
 }
 
 type uploadState struct {
@@ -128,10 +130,10 @@ func (s *Server) Router() http.Handler {
 	r.Get("/api/me", s.me)
 	r.Get("/api/admin/audit", s.adminAudit)
 	r.Get("/api/admin/audit/actions", s.adminAuditActions)
+	r.Get("/api/admin/export", s.adminExport)
+	r.Post("/api/admin/import", s.adminImport)
 	r.Get("/api/admin/preferences", s.adminPreferences)
 	r.Put("/api/admin/preferences", s.updateAdminPreferences)
-	r.Get("/api/admin/settings", s.adminSettings)
-	r.Put("/api/admin/settings", s.updateAdminSettings)
 	r.Get("/api/admin/organizations", s.adminOrganizations)
 	r.Post("/api/admin/organizations", s.createAdminOrganization)
 	r.Put("/api/admin/organizations", s.updateAdminOrganization)
@@ -143,10 +145,15 @@ func (s *Server) Router() http.Handler {
 	r.Get("/api/settings", s.settings)
 	r.Put("/api/settings", s.updateSettings)
 	r.Get("/api/connections", s.connectionController().List)
+	r.Get("/api/organizations", s.memberOrganizations)
 	r.Post("/api/connections", s.connectionController().Create)
 	r.Post("/api/connections/test", s.connectionController().Test)
 	r.Put("/api/connections", s.connectionController().Update)
 	r.Delete("/api/connections", s.connectionController().Delete)
+	r.Get("/api/connection-groups", s.connectionGroups)
+	r.Post("/api/connection-groups", s.createConnectionGroup)
+	r.Put("/api/connection-groups", s.renameConnectionGroup)
+	r.Delete("/api/connection-groups", s.deleteConnectionGroup)
 	r.Post("/api/folders", s.createFolder)
 	r.Get("/api/browse", s.browse)
 	r.Get("/api/search", s.search)
@@ -230,44 +237,6 @@ func (s *Server) adminPreferences(w http.ResponseWriter, r *http.Request) {
 	write(w, preferences)
 }
 
-func (s *Server) applicationSettingsRepository() repository.ApplicationSettingsRepository {
-	if s.ApplicationSettingsRepo != nil {
-		return s.ApplicationSettingsRepo
-	}
-	return s.Vault.ApplicationSettingsRepository()
-}
-
-func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.adminAllowed(r); !ok {
-		fail(w, http.StatusForbidden, errors.New("administrator access required"))
-		return
-	}
-	settings, err := s.applicationSettingsRepository().Get()
-	if err != nil {
-		fail(w, http.StatusInternalServerError, err)
-		return
-	}
-	write(w, settings)
-}
-
-func (s *Server) updateAdminSettings(w http.ResponseWriter, r *http.Request) {
-	session, ok := s.adminAllowed(r)
-	if !ok {
-		fail(w, http.StatusForbidden, errors.New("administrator access required"))
-		return
-	}
-	var settings model.ApplicationSettings
-	if err := DecodeJSON(w, r, &settings); err != nil || settings.ArchiveMaxBytes <= 0 {
-		fail(w, http.StatusBadRequest, errors.New("archive max bytes must be positive"))
-		return
-	}
-	if err := s.applicationSettingsRepository().Save(settings); err != nil {
-		fail(w, http.StatusInternalServerError, err)
-		return
-	}
-	s.audit(session, "application-settings.update", "success", nil)
-	write(w, settings)
-}
 func (s *Server) updateAdminPreferences(w http.ResponseWriter, r *http.Request) {
 	session, ok := s.adminAllowed(r)
 	if !ok {
@@ -289,6 +258,361 @@ func (s *Server) updateAdminPreferences(w http.ResponseWriter, r *http.Request) 
 func (s *Server) adminAllowed(r *http.Request) (auth.Session, bool) {
 	session, _, err := s.session(r)
 	return session, err == nil && s.AuditAdminGroup != "" && hasGroup(session.User.Groups, []string{s.AuditAdminGroup})
+}
+
+func (s *Server) adminExport(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.adminAllowed(r); !ok {
+		fail(w, http.StatusForbidden, errors.New("administrator access required"))
+		return
+	}
+	bundle, err := s.Vault.ExportBundle()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	raw, err := json.MarshalIndent(bundle, "", "  ")
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", `attachment; filename="mariner-export-v1.json"`)
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(raw)
+}
+
+func (s *Server) adminImport(w http.ResponseWriter, r *http.Request) {
+	session, ok := s.adminAllowed(r)
+	if !ok {
+		fail(w, http.StatusForbidden, errors.New("administrator access required"))
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 256<<20)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var bundle vault.ExportBundle
+	if err := decoder.Decode(&bundle); err != nil {
+		fail(w, http.StatusBadRequest, errors.New("invalid Mariner export file"))
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		fail(w, http.StatusBadRequest, errors.New("export file contains multiple JSON values"))
+		return
+	}
+	if err := s.Vault.ImportBundle(bundle); err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	s.audit(session, "system.import", "success", nil)
+	write(w, map[string]any{"ok": true, "version": bundle.Version})
+}
+func (s *Server) memberOrganizations(w http.ResponseWriter, r *http.Request) {
+	session, _, err := s.session(r)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, err)
+		return
+	}
+	organizations := s.organizationConfig()
+	result := make([]map[string]string, 0, len(organizations))
+	for _, organization := range organizations {
+		if hasGroup(session.User.Groups, organization.Groups) {
+			result = append(result, map[string]string{"id": organization.ID, "name": organization.Name})
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i]["name"] < result[j]["name"] })
+	write(w, result)
+}
+
+type connectionGroupRequest struct {
+	Organization string `json:"organization,omitempty"`
+	Path         string `json:"path"`
+	NewPath      string `json:"newPath,omitempty"`
+}
+type connectionGroupResponse struct {
+	Organization string `json:"organization,omitempty"`
+	Path         string `json:"path"`
+}
+
+func (s *Server) connectionGroups(w http.ResponseWriter, r *http.Request) {
+	session, _, data, err := s.unlocked(r)
+	if err != nil {
+		fail(w, http.StatusLocked, err)
+		return
+	}
+	result := make([]connectionGroupResponse, 0)
+	for _, path := range connectionGroupPaths(data.ConnectionGroups, data.Connections) {
+		result = append(result, connectionGroupResponse{Path: path})
+	}
+	for _, organization := range s.organizationConfig() {
+		if !hasGroup(session.User.Groups, organization.Groups) {
+			continue
+		}
+		for _, path := range connectionGroupPaths(organization.ConnectionGroups, organizationConnectionValues(organization)) {
+			result = append(result, connectionGroupResponse{Organization: organization.ID, Path: path})
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Organization == result[j].Organization {
+			return result[i].Path < result[j].Path
+		}
+		return result[i].Organization < result[j].Organization
+	})
+	write(w, result)
+}
+
+func (s *Server) createConnectionGroup(w http.ResponseWriter, r *http.Request) {
+	session, _, data, err := s.unlocked(r)
+	if err != nil {
+		fail(w, http.StatusLocked, err)
+		return
+	}
+	var request connectionGroupRequest
+	if DecodeJSON(w, r, &request) != nil || strings.TrimSpace(request.Path) == "" {
+		fail(w, http.StatusBadRequest, errors.New("group path is required"))
+		return
+	}
+	request.Path = strings.Trim(strings.TrimSpace(request.Path), "/")
+	if err := model.ValidateConnectionGroupPath(request.Path); err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	if request.Organization != "" {
+		organization, resolveErr := s.ResolveOrganization(session.User.Groups, request.Organization)
+		if resolveErr != nil {
+			fail(w, http.StatusForbidden, resolveErr)
+			return
+		}
+		organization.ConnectionGroups = appendGroupPath(organization.ConnectionGroups, request.Path)
+		if err := s.organizationRepository().Save(organization); err != nil {
+			fail(w, http.StatusInternalServerError, err)
+			return
+		}
+	} else {
+		data.ConnectionGroups = appendGroupPath(data.ConnectionGroups, request.Path)
+		if err := s.Vault.Save(session.User.ID, session.Password, data); err != nil {
+			fail(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	write(w, connectionGroupResponse{Organization: request.Organization, Path: request.Path})
+}
+
+func (s *Server) deleteConnectionGroup(w http.ResponseWriter, r *http.Request) {
+	session, _, data, err := s.unlocked(r)
+	if err != nil {
+		fail(w, http.StatusLocked, err)
+		return
+	}
+	request := connectionGroupRequest{Organization: r.URL.Query().Get("organization"), Path: strings.Trim(strings.TrimSpace(r.URL.Query().Get("path")), "/")}
+	if err := model.ValidateConnectionGroupPath(request.Path); err != nil || request.Path == "" {
+		fail(w, http.StatusBadRequest, errors.New("valid group path is required"))
+		return
+	}
+	if request.Organization != "" {
+		organization, resolveErr := s.ResolveOrganization(session.User.Groups, request.Organization)
+		if resolveErr != nil {
+			fail(w, http.StatusForbidden, resolveErr)
+			return
+		}
+		if groupHasConnections(request.Path, organizationConnectionValues(organization)) || hasChildGroup(request.Path, organization.ConnectionGroups) {
+			fail(w, http.StatusConflict, errors.New("group must be empty before deletion"))
+			return
+		}
+		organization.ConnectionGroups = removeGroupPath(organization.ConnectionGroups, request.Path)
+		if err := s.organizationRepository().Save(organization); err != nil {
+			fail(w, http.StatusInternalServerError, err)
+			return
+		}
+	} else {
+		if groupHasConnections(request.Path, data.Connections) || hasChildGroup(request.Path, data.ConnectionGroups) {
+			fail(w, http.StatusConflict, errors.New("group must be empty before deletion"))
+			return
+		}
+		data.ConnectionGroups = removeGroupPath(data.ConnectionGroups, request.Path)
+		if err := s.Vault.Save(session.User.ID, session.Password, data); err != nil {
+			fail(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) renameConnectionGroup(w http.ResponseWriter, r *http.Request) {
+	session, _, data, err := s.unlocked(r)
+	if err != nil {
+		fail(w, http.StatusLocked, err)
+		return
+	}
+	var request connectionGroupRequest
+	if DecodeJSON(w, r, &request) != nil {
+		return
+	}
+	request.Path = strings.Trim(strings.TrimSpace(request.Path), "/")
+	request.NewPath = strings.Trim(strings.TrimSpace(request.NewPath), "/")
+	if request.Path == "" || request.NewPath == "" {
+		fail(w, http.StatusBadRequest, errors.New("valid current and new group paths are required"))
+		return
+	}
+	if err := model.ValidateConnectionGroupPath(request.Path); err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := model.ValidateConnectionGroupPath(request.NewPath); err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	if request.Path == request.NewPath {
+		write(w, connectionGroupResponse{Organization: request.Organization, Path: request.NewPath})
+		return
+	}
+	if strings.HasPrefix(request.NewPath, request.Path+"/") {
+		fail(w, http.StatusBadRequest, errors.New("a group cannot be moved inside itself"))
+		return
+	}
+	if request.Organization != "" {
+		organization, resolveErr := s.ResolveOrganization(session.User.Groups, request.Organization)
+		if resolveErr != nil {
+			fail(w, http.StatusForbidden, resolveErr)
+			return
+		}
+		if hasGroupPath(request.NewPath, organization.ConnectionGroups) {
+			fail(w, http.StatusConflict, errors.New("the new group path already exists"))
+			return
+		}
+		organization.ConnectionGroups = renameGroupPaths(organization.ConnectionGroups, request.Path, request.NewPath)
+		for key, connection := range organization.Connections {
+			connection.GroupPath = renameGroupPath(connection.GroupPath, request.Path, request.NewPath)
+			organization.Connections[key] = connection
+		}
+		if err := s.organizationRepository().Save(organization); err != nil {
+			fail(w, http.StatusInternalServerError, err)
+			return
+		}
+	} else {
+		if hasGroupPath(request.NewPath, data.ConnectionGroups) {
+			fail(w, http.StatusConflict, errors.New("the new group path already exists"))
+			return
+		}
+		data.ConnectionGroups = renameGroupPaths(data.ConnectionGroups, request.Path, request.NewPath)
+		for i := range data.Connections {
+			data.Connections[i].GroupPath = renameGroupPath(data.Connections[i].GroupPath, request.Path, request.NewPath)
+		}
+		if err := s.Vault.Save(session.User.ID, session.Password, data); err != nil {
+			fail(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	write(w, connectionGroupResponse{Organization: request.Organization, Path: request.NewPath})
+}
+
+func hasGroupPath(path string, groups []string) bool {
+	for _, group := range groups {
+		if group == path || strings.HasPrefix(group, path+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func renameGroupPath(path, oldPath, newPath string) string {
+	if path == oldPath {
+		return newPath
+	}
+	if strings.HasPrefix(path, oldPath+"/") {
+		return newPath + strings.TrimPrefix(path, oldPath)
+	}
+	return path
+}
+
+func renameGroupPaths(groups []string, oldPath, newPath string) []string {
+	result := make([]string, 0, len(groups))
+	for _, group := range groups {
+		updated := renameGroupPath(group, oldPath, newPath)
+		if !containsString(result, updated) {
+			result = append(result, updated)
+		}
+	}
+	return result
+}
+
+func organizationConnectionValues(organization vault.Organization) []model.Connection {
+	result := make([]model.Connection, 0, len(organization.Connections))
+	for _, connection := range organization.Connections {
+		result = append(result, connection.Connection)
+	}
+	return result
+}
+func connectionGroupPaths(groups []string, connections []model.Connection) []string {
+	result := make([]string, 0, len(groups))
+	for _, group := range groups {
+		result = appendGroupPath(result, group)
+	}
+	for _, connection := range connections {
+		if connection.GroupPath != "" {
+			result = appendGroupPath(result, connection.GroupPath)
+		}
+	}
+	sort.Strings(result)
+	return uniqueStrings(result)
+}
+func appendGroupPath(groups []string, path string) []string {
+	prefix := ""
+	for _, part := range strings.Split(path, "/") {
+		if part == "" {
+			continue
+		}
+		if prefix != "" {
+			prefix += "/"
+		}
+		prefix += part
+		if !containsString(groups, prefix) {
+			groups = append(groups, prefix)
+		}
+	}
+	return groups
+}
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+func uniqueStrings(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if !containsString(result, value) {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+func removeGroupPath(groups []string, target string) []string {
+	result := make([]string, 0, len(groups))
+	for _, group := range groups {
+		if group != target {
+			result = append(result, group)
+		}
+	}
+	return result
+}
+func hasChildGroup(parent string, groups []string) bool {
+	for _, group := range groups {
+		if group != parent && model.ConnectionGroupContains(parent, group) {
+			return true
+		}
+	}
+	return false
+}
+func groupHasConnections(parent string, connections []model.Connection) bool {
+	for _, connection := range connections {
+		if model.ConnectionGroupContains(parent, connection.GroupPath) {
+			return true
+		}
+	}
+	return false
 }
 func (s *Server) adminOrganizations(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.adminAllowed(r); !ok {
@@ -571,6 +895,19 @@ func (s *Server) IsOrganizationConnection(id string) bool {
 	return s.isOrganizationConnection(id)
 }
 
+// ResolveOrganization authorizes a user against the effective organization
+// configuration used for both browsing and member-managed connections.
+func (s *Server) ResolveOrganization(groups []string, id string) (model.Organization, error) {
+	organization, ok := s.organizationConfig()[id]
+	if !ok {
+		return model.Organization{}, api.ErrOrganizationNotFound
+	}
+	if !hasGroup(groups, organization.Groups) {
+		return model.Organization{}, api.ErrOrganizationMembership
+	}
+	return organization, nil
+}
+
 func (s *Server) connectionController() *connectioncontroller.ConnectionController {
 	if s.ConnectionCtrl == nil {
 		s.ConnectionCtrl = &connectioncontroller.ConnectionController{
@@ -667,9 +1004,8 @@ func (s *Server) withOrganizations(user auth.User, data vault.Data) vault.Data {
 				c.Name = connectionName
 			}
 			c.ID = org.ID + ":" + c.ID
-			if org.Name != "" {
-				c.Name = org.Name + " / " + c.Name
-			}
+			c.Organization = org.ID
+			c.OrganizationCanManage = true
 			result.Connections = append(result.Connections, c)
 		}
 	}
@@ -1259,10 +1595,9 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, errors.New("S3 service is not configured"))
 		return
 	}
-	settings, err := s.applicationSettingsRepository().Get()
-	if err != nil {
-		fail(w, http.StatusInternalServerError, err)
-		return
+	maxBytes := s.ArchiveMaxBytes
+	if maxBytes <= 0 {
+		maxBytes = model.DefaultArchiveMaxBytes
 	}
 	name := strings.Trim(strings.TrimSuffix(prefix, "/"), "/")
 	if name == "" {
@@ -1275,24 +1610,20 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", safeDownloadName(name+ext)))
-	if err = s.Storage.DownloadArchive(r.Context(), c, prefix, format, settings.ArchiveMaxBytes, w); err != nil {
+	if err = s.Storage.DownloadArchive(r.Context(), c, prefix, format, maxBytes, w); err != nil {
 		return
 	}
 	s.audit(session, "object.download", "success", map[string]string{"connection_id": c.ID, "bucket": c.Bucket, "object_key": prefix})
 }
-func publicConnections(data vault.Data) []vault.Connection {
-	result := make([]vault.Connection, 0, len(data.Connections))
+func publicConnections(data vault.Data) []dto.ConnectionResponse {
+	result := make([]dto.ConnectionResponse, 0, len(data.Connections))
 	for _, c := range data.Connections {
 		result = append(result, publicConnection(c))
 	}
 	return result
 }
-func publicConnection(connection vault.Connection) vault.Connection {
-	response := mapper.ConnectionToResponse(connection)
-	return vault.Connection{
-		ID: response.ID, Name: response.Name, Bucket: response.Bucket,
-		Region: response.Region, Endpoint: response.Endpoint, Prefix: response.Prefix,
-	}
+func publicConnection(connection vault.Connection) dto.ConnectionResponse {
+	return mapper.ConnectionToResponse(connection)
 }
 func safeDownloadName(name string) string {
 	name = strings.Map(func(r rune) rune {

@@ -61,8 +61,12 @@ func main() {
 		os.Exit(1)
 	}
 	storage := s3service.NewWithUploadSettings(cfg.UploadPartSize, cfg.UploadPartConcurrency)
-	server := &httpapi.Server{Auth: authService, Vault: store, Audit: auditLogger, AuditRepo: store.AuditRepository(), OrganizationRepo: store.OrganizationRepository(), PreferenceRepo: store.UserPreferenceRepository(), ApplicationSettingsRepo: store.ApplicationSettingsRepository(), Storage: storage, AuditAdminGroup: cfg.AuditAdminGroup, Organizations: cfg.Organizations, RateLimitEnabled: cfg.RateLimitEnabled, RateLimitWindow: cfg.RateLimitWindow, LoginRateLimit: cfg.LoginRateLimit, UnlockRateLimit: cfg.UnlockRateLimit, ConnectionTestRateLimit: cfg.ConnectionTestRateLimit, UploadPartSize: cfg.UploadPartSize, UploadPartConcurrency: cfg.UploadPartConcurrency}
+	server := &httpapi.Server{Auth: authService, Vault: store, Audit: auditLogger, AuditRepo: store.AuditRepository(), OrganizationRepo: store.OrganizationRepository(), PreferenceRepo: store.UserPreferenceRepository(), Storage: storage, ArchiveMaxBytes: cfg.ArchiveMaxBytes, AuditAdminGroup: cfg.AuditAdminGroup, Organizations: cfg.Organizations, RateLimitEnabled: cfg.RateLimitEnabled, RateLimitWindow: cfg.RateLimitWindow, LoginRateLimit: cfg.LoginRateLimit, UnlockRateLimit: cfg.UnlockRateLimit, ConnectionTestRateLimit: cfg.ConnectionTestRateLimit, UploadPartSize: cfg.UploadPartSize, UploadPartConcurrency: cfg.UploadPartConcurrency}
 	server.Connections = api.NewConnectionAPI(store.VaultRepository(), storage, uuid.NewString, server.IsOrganizationConnection)
+	if connectionAPI, ok := server.Connections.(*api.ConnectionAPI); ok {
+		connectionAPI.Organizations = store.OrganizationRepository()
+		connectionAPI.ResolveOrganization = server.ResolveOrganization
+	}
 	slog.Info("mariner listening", "addr", cfg.Addr)
 	if err := http.ListenAndServe(cfg.Addr, server.Router()); err != nil {
 		slog.Error("HTTP server stopped", "error", err)

@@ -16,10 +16,10 @@ import (
 
 type ConnectionUseCase interface {
 	List(userID, password string) ([]model.Connection, error)
-	Create(ctx context.Context, userID, password string, connection model.Connection) (string, error)
-	Test(ctx context.Context, userID, password string, connection model.Connection, admin bool) error
-	Update(ctx context.Context, userID, password string, connection model.Connection) error
-	Delete(userID, password, id string) error
+	Create(ctx context.Context, userID, password string, groups []string, connection model.Connection) (string, error)
+	Test(ctx context.Context, userID, password string, groups []string, connection model.Connection, admin bool) error
+	Update(ctx context.Context, userID, password string, groups []string, connection model.Connection) error
+	Delete(userID, password string, groups []string, id string) error
 }
 
 type ConnectionController struct {
@@ -61,9 +61,13 @@ func (c *ConnectionController) Create(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	id, err := c.API.Create(r.Context(), session.User.ID, session.Password, connection)
+	id, err := c.API.Create(r.Context(), session.User.ID, session.Password, session.User.Groups, connection)
 	if err != nil {
-		fail(w, http.StatusBadRequest, err)
+		status := http.StatusBadRequest
+		if errors.Is(err, api.ErrOrganizationMembership) || errors.Is(err, api.ErrOrganizationNotFound) {
+			status = http.StatusForbidden
+		}
+		fail(w, status, err)
 		return
 	}
 	write(w, mapper.ConnectionID(id))
@@ -84,8 +88,12 @@ func (c *ConnectionController) Test(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := c.API.Test(r.Context(), session.User.ID, session.Password, connection, admin); err != nil {
-		fail(w, http.StatusBadRequest, err)
+	if err := c.API.Test(r.Context(), session.User.ID, session.Password, session.User.Groups, connection, admin); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, api.ErrOrganizationMembership) || errors.Is(err, api.ErrOrganizationNotFound) {
+			status = http.StatusForbidden
+		}
+		fail(w, status, err)
 		return
 	}
 	write(w, map[string]bool{"ok": true})
@@ -105,9 +113,9 @@ func (c *ConnectionController) Update(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, errors.New("connection id is required"))
 		return
 	}
-	if err := c.API.Update(r.Context(), session.User.ID, session.Password, connection); err != nil {
+	if err := c.API.Update(r.Context(), session.User.ID, session.Password, session.User.Groups, connection); err != nil {
 		status := http.StatusBadRequest
-		if errors.Is(err, api.ErrOrganizationConnection) {
+		if errors.Is(err, api.ErrOrganizationMembership) || errors.Is(err, api.ErrOrganizationNotFound) {
 			status = http.StatusForbidden
 		} else if errors.Is(err, api.ErrConnectionNotFound) {
 			status = http.StatusNotFound
@@ -126,9 +134,9 @@ func (c *ConnectionController) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.URL.Query().Get("id")
-	if err := c.API.Delete(session.User.ID, session.Password, id); err != nil {
+	if err := c.API.Delete(session.User.ID, session.Password, session.User.Groups, id); err != nil {
 		status := http.StatusInternalServerError
-		if errors.Is(err, api.ErrOrganizationConnection) {
+		if errors.Is(err, api.ErrOrganizationMembership) || errors.Is(err, api.ErrOrganizationNotFound) {
 			status = http.StatusForbidden
 		}
 		fail(w, status, err)

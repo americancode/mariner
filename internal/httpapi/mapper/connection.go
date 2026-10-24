@@ -19,7 +19,9 @@ func ConnectionFromRequest(input dto.ConnectionRequest) (model.Connection, error
 	}{
 		"id": {input.ID, 128}, "name": {input.Name, 128}, "bucket": {input.Bucket, 255},
 		"region": {input.Region, 128}, "endpoint": {input.Endpoint, 2048}, "prefix": {input.Prefix, 4096},
-		"access key": {input.AccessKey, 512}, "secret key": {input.SecretKey, 2048},
+		"organization": {input.Organization, 128},
+		"group path":   {input.GroupPath, 1024},
+		"access key":   {input.AccessKey, 512}, "secret key": {input.SecretKey, 2048},
 	} {
 		if utf8.RuneCountInString(item.value) > item.limit {
 			return model.Connection{}, errors.New(field + " is too long")
@@ -38,6 +40,11 @@ func ConnectionFromRequest(input dto.ConnectionRequest) (model.Connection, error
 	connection.AccessKey = input.AccessKey
 	connection.SecretKey = input.SecretKey
 	connection.Prefix = input.Prefix
+	connection.Organization = input.Organization
+	connection.GroupPath = input.GroupPath
+	if err := model.ValidateConnectionGroupPath(connection.GroupPath); err != nil {
+		return model.Connection{}, err
+	}
 	return connection, nil
 }
 
@@ -46,12 +53,15 @@ func ConnectionFromRequest(input dto.ConnectionRequest) (model.Connection, error
 // the browser when fields are added to the domain model later.
 func ConnectionToResponse(connection model.Connection) dto.ConnectionResponse {
 	return dto.ConnectionResponse{
-		ID:       connection.ID,
-		Name:     connection.Name,
-		Bucket:   connection.Bucket,
-		Region:   connection.Region,
-		Endpoint: connection.Endpoint,
-		Prefix:   connection.Prefix,
+		ID:                    connection.ID,
+		Name:                  connection.Name,
+		Bucket:                connection.Bucket,
+		Region:                connection.Region,
+		Endpoint:              connection.Endpoint,
+		Prefix:                connection.Prefix,
+		Organization:          connection.Organization,
+		OrganizationCanManage: connection.OrganizationCanManage,
+		GroupPath:             connection.GroupPath,
 	}
 }
 

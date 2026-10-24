@@ -28,8 +28,3 @@ type UserPreferenceRepository interface {
 	Get(userID string) (map[string]bool, error)
 	Save(userID string, settings map[string]bool) error
 }
-
-type ApplicationSettingsRepository interface {
-	Get() (model.ApplicationSettings, error)
-	Save(settings model.ApplicationSettings) error
-}
